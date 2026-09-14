@@ -33,26 +33,26 @@ APP_TEMP_DATA = Path("/data/app_temp_data")
 APP_ARCHIVE = Path("/data/app_archive")
 VM_DATA_DIR = Path("/data/vm_data")
 
-# Roots the backup app captures when the ``access_all_app_data = true``
-# manifest permission is in effect. Order is significant only for UI
-# display (``list_snapshot_files`` surfaces these as the top-level
-# entries when ``root`` is unset). Any root that doesn't exist on disk
-# at backup time is skipped silently so the app still works on
-# instances that only grant a subset of these mounts.
+# Candidate roots, captured only when present as directories in this container.
+# Standard ``access_all_app_data = true`` mounts expose app data, not router
+# state or host SSH keys; vm_data is an optional, nonstandard candidate.
+# Order is significant only for UI display (``list_snapshot_files`` surfaces
+# these as the top-level entries when ``root`` is unset). Missing roots are
+# skipped silently at backup time.
 BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
 
 # ``access_all_app_data = true`` mounts ``/data/app_archive`` into the
 # container so the backup app can see it for migration / inspection,
-# but the archive tier is intentionally NOT backed up:
+# but the archive tier is intentionally NOT backed up for either backend:
 #
-# - ``local`` archive backend: the data already lives on the host's
-#   persistent volume — operators back that up out-of-band the same
-#   way they back up app_data.
-# - ``s3`` archive backend: the bytes are already in S3 (the bucket
-#   IS the durable store) and JuiceFS writes hourly metadata dumps
-#   to ``<bucket>/<prefix>/meta/`` so the metadata DB is recoverable
-#   too.  Pulling those bytes back through restic would double-store
-#   them and inflate snapshot size by orders of magnitude.
+# - ``local`` archive backend: data stays on the instance's disk, so it is
+#   not an off-machine copy.
+# - ``s3`` archive backend: file data is stored through JuiceFS; recovery
+#   requires JuiceFS metadata as well as the S3 objects.
+#
+# The entire app_data/backup directory is also excluded: configuration,
+# history, and any local restic repository stored there. Excluding a local
+# repository avoids recursive self-inclusion.
 #
 # Restic still receives this as an explicit ``--exclude`` (in addition
 # to ``/data/app_archive`` not being in BACKUP_ROOTS), so a future
@@ -903,9 +903,8 @@ async def run_backup(name: str | None = None) -> bool:
 
         tags = _backup_tags(name)
 
-        # Back up every mounted root (app_data, app_temp_data, vm_data).
-        # Skip ones that aren't present — this keeps the app usable on
-        # instances that only grant a subset of data permissions.
+        # Back up candidate roots (app_data, app_temp_data, optional vm_data)
+        # only when present as directories in this container.
         roots = [p for p in BACKUP_ROOTS if p.is_dir()]
         if not roots:
             msg = "No backup roots available — expected one of: " + ", ".join(
@@ -921,9 +920,8 @@ async def run_backup(name: str | None = None) -> bool:
         # one stable identity (see BACKUP_HOST) instead of the container's
         # random per-restart hostname.
         args += ["--host", BACKUP_HOST]
-        # Exclude our own restic repo (avoid self-inclusion + infinite
-        # growth) and ``/data/app_archive`` (rationale documented at the
-        # BACKUP_EXCLUDES definition).
+        # Exclude the entire backup app data directory and app_archive
+        # (scope documented at the BACKUP_EXCLUDES definition).
         for ex in BACKUP_EXCLUDES:
             args += ["--exclude", str(ex)]
         for t in tags:
@@ -1010,9 +1008,8 @@ async def run_backup(name: str | None = None) -> bool:
     finally:
         op_lock.release(OpKind.BACKUP)
         # Retention forgot snapshots but didn't prune — reclaim the space in
-        # the background so it doesn't extend the backup or hold the lock for
-        # prune's full duration. Scheduled after the lock is released so the
-        # worker can acquire it.
+        # a background worker after releasing the backup lock. The worker
+        # acquires its own operation lock for the prune's full duration.
         if removed:
             schedule_prune()
 
@@ -1754,7 +1751,7 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         # restic 0.17 forbids mixing --include and --exclude in one
         # restore. When restoring a specific root we use --include
         # (narrowing); otherwise we use --exclude so we don't clobber
-        # our own repo directory or the archive tier (which the backup
+        # our own data directory or the archive tier (which the backup
         # never captured in the first place — see BACKUP_EXCLUDES).
         if root:
             args += ["--include", str(_ROOT_NAMES[root])]
@@ -1796,14 +1793,10 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
 async def run_check() -> bool:
     """Run `restic check`. Updates module-level state.
 
-    Runs with ``--no-lock`` so the check takes no restic repo lock — it's a
-    read-only integrity scan and can be long (up to 2h), so claiming the
-    exclusive ``op_lock`` would needlessly block scheduled backups (which
-    restic itself would let run concurrently). Because it holds no restic lock,
-    the "op_lock held whenever a restic lock is held" invariant is satisfied
-    without op_lock. Mutual exclusion is handled by the caller: the /api/check
-    route rejects a check while another operation holds op_lock, and
-    ``check_running`` prevents two checks at once.
+    The integrity scan uses ``--no-lock`` and does not claim ``op_lock``.
+    The /api/check route rejects a start while op_lock is busy or
+    ``check_running`` is set, but operations started after the check begins
+    can overlap the scan.
     """
     global check_last_status, check_last_output, check_last_at, check_running
     # Set the flag inside the try so that any exception from load_config /
@@ -1830,11 +1823,9 @@ async def run_check() -> bool:
             return False
         try:
             rc, stdout, stderr = await _run_restic(
-                # View-only integrity scan: run with --no-lock so it takes no
-                # restic lock (upholding "op_lock held whenever a restic lock is
-                # held" without gating check behind op_lock) and never blocks a
-                # backup. The route refuses to *start* a check while another op
-                # holds op_lock, so it won't scan a repo mid-modification.
+                # No repo lock or op_lock is held during this scan. The route
+                # gates only its start; later operations can modify the repo
+                # while the check is still running.
                 ["check", "--no-lock"], conf, timeout=CHECK_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
@@ -1999,10 +1990,9 @@ def _backup_scope_summary() -> dict:
     drift from the actual restic command line.  Each entry carries
     a short ``reason`` string suitable for inline rendering.
 
-    ``present`` reflects whether the path exists on disk now; the
-    backup loop skips missing roots (instances may grant only a
-    subset of data permissions), so showing this lets the operator
-    distinguish "permission not granted" from "present and excluded".
+    ``present`` reflects current presence in this container (included roots
+    must be directories). The backup loop skips missing roots; this is not
+    a check of which permissions the platform has granted.
     """
     included = []
     for p in BACKUP_ROOTS:
@@ -2011,25 +2001,26 @@ def _backup_scope_summary() -> dict:
     excluded = []
     for p in BACKUP_EXCLUDES:
         # ``user_facing=False`` marks an exclude that's an
-        # implementation detail (the backup app's own restic repo
-        # dir) rather than something the operator chose to keep
-        # outside the snapshot pipeline.  Surfaced this way so the
+        # implementation detail (the backup app's own data dir).
+        # Surfaced this way so the
         # snapshots-browser note can hide self-references without
         # the JS having to hard-code which path that is — the JS
         # filters on ``user_facing`` and stays in lockstep with
         # whatever the helper decides counts as operator-relevant.
         if p == APP_ARCHIVE:
             reason = (
-                "Archive tier is its own durable store (S3 bucket or "
-                "host-managed local archive); double-storing through "
-                "restic would inflate snapshots without adding safety."
+                "Archive data is intentionally excluded for both local and S3 "
+                "archive backends. Local archive data stays on the instance's "
+                "disk, not in an off-machine copy. S3 archive recovery requires "
+                "JuiceFS metadata as well as the S3 objects."
             )
             user_facing = True
         elif p == ALL_APP_DATA / "backup":
             reason = (
-                "The backup app's own data dir contains the restic "
-                "repository — including it would self-reference and "
-                "grow each snapshot unboundedly."
+                "The entire backup app data directory is excluded, including "
+                "configuration, backup history, and any local restic repository "
+                "stored here. This also avoids recursive self-inclusion of "
+                "a repository stored in this directory."
             )
             user_facing = False
         else:

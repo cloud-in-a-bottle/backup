@@ -4,9 +4,9 @@ User-controlled incremental backups and cross-instance migration for Cloud in a 
 
 ## What it does
 
-This app backs up the persistent data on a Cloud in a Bottle instance to a storage backend you control: S3, Backblaze B2, SFTP, Google Cloud Storage, Azure Blob, OpenStack Swift, rclone remotes, a restic REST server, or a local directory. Backups are incremental and deduplicated (restic handles this automatically), so only changed data is transferred on each run. It also provides a migration tool that pushes apps and data from one Cloud in a Bottle instance to another over HTTP.
+This app backs up container-visible app data on a Cloud in a Bottle instance to a storage backend you control: S3, Backblaze B2, SFTP, Google Cloud Storage, Azure Blob, OpenStack Swift, rclone remotes, a restic REST server, or a local directory. Backups are incremental and deduplicated (restic handles this automatically), so only changed data is transferred on each run. It also provides a migration tool that pushes apps and data from one Cloud in a Bottle instance to another over HTTP.
 
-The app has `access_all_app_data = true` in its manifest, which means it can see every app's persistent, temporary, and archive data. Restic snapshots include persistent and temporary data; the archive tier (`/data/app_archive`) is intentionally excluded because it already lives in durable storage (an S3 bucket or host-managed local archive).
+The app has `access_all_app_data = true` in its manifest, which exposes apps' persistent, temporary, and archive data to the container. Restic snapshots include the persistent and temporary data roots subject to the exclusions below; the archive tier (`/data/app_archive`) is excluded for both local and S3 archive backends.
 
 ## Getting started
 
@@ -19,20 +19,26 @@ The app has `access_all_app_data = true` in its manifest, which means it can see
 
 ## Backup scope
 
-Each backup captures these directories (if they exist on the instance):
+Each backup captures these directories only if they are present in the backup app's container, subject to the exclusions below:
 
 | Path | Contents |
 |------|----------|
 | `/data/app_data` | Persistent app data (databases, config, user files) |
 | `/data/app_temp_data` | App temp data (caches, build artifacts) |
-| `/data/vm_data` | VM-level data (router database, SSH keys) |
+| `/data/vm_data` | Optional additional data, only when this directory is exposed through a nonstandard mount or otherwise present in the container |
+
+Standard platform mounts do not expose router state or host SSH keys to this app. The optional `/data/vm_data` candidate does not make those part of a standard backup.
 
 Excluded from backups:
 
 | Path | Reason |
 |------|--------|
-| `/data/app_data/backup` | The backup app's own restic repo (self-inclusion would grow unboundedly) |
-| `/data/app_archive` | Archive tier is its own durable store; double-storing through restic would inflate snapshots without adding safety |
+| `/data/app_data/backup` | The entire backup app data directory, including configuration, backup history, and any local restic repository stored there |
+| `/data/app_archive` | Archive data is intentionally excluded for both local and S3 archive backends |
+
+The local archive backend stores data on the instance's disk; it is not an off-machine copy. The S3 archive backend stores file data through JuiceFS, and recovery requires JuiceFS metadata as well as the S3 objects. These restic snapshots do not capture the archive contents.
+
+Backups read live files without stopping apps or coordinating database snapshots. Files changing during a backup are not guaranteed to form an application-consistent recovery point.
 
 ## Supported backends
 
@@ -77,14 +83,14 @@ A snapshot is kept if it matches **any** rule (the rules are OR'd), so tiers com
 
 The policy is applied across all `bottle`-tagged snapshots (and legacy `openhost`-tagged ones) as a single group (`--group-by ''`), which assumes one instance per repository. Every snapshot is recorded with a stable host (`--host`, set to the zone domain) so its identity doesn't change when the backup container is redeployed.
 
-Retention runs `forget` inline after the backup (fast — it only rewrites metadata) and reconciles the backup history database to match. The actual space is reclaimed by a `restic prune`, which runs **in the background** and only when snapshots were actually expired, so it never delays the backup or blocks the UI.
+Retention runs `forget` inline after the backup and reconciles the backup history database to match. The actual space is reclaimed by a `restic prune`, which runs **in the background** only when snapshots were actually expired. The prune waits for and holds the operation lock while it runs: other lock-taking operations cannot start, and scheduled backups attempted during that time are skipped.
 
 ## Snapshots
 
 Each successful backup creates a restic snapshot tagged with `bottle`. Older snapshots tagged `openhost` are still listed, restored, and expired. The UI lists snapshots newest-first and lets you:
 
 - Browse files in any snapshot (organized by data root: app_data, app_temp_data, vm_data)
-- Restore a snapshot (to all data roots, or to a specific root)
+- Restore a full snapshot (all captured data roots, with the exclusions described below; single-root restore is API-only)
 - Delete a snapshot (runs `restic forget --prune` to reclaim space)
 - Name or rename a snapshot for easier identification
 
@@ -92,11 +98,11 @@ The Status panel shows the **repo size** — the deduplicated, compressed on-dis
 
 ## Restoring
 
-Restore overwrites files in place. During a full restore (all data roots), the app excludes its own data directory and the archive tier, so a restore will not clobber the backup configuration or the restic repository itself. When restoring a single root, restic's `--include` filter is used instead, and the excludes do not apply (restic does not allow combining `--include` and `--exclude` in one restore command).
+Restore writes files in place and can overwrite current data. During a full restore (all captured data roots), the app excludes `/data/app_data/backup` and `/data/app_archive`, preserving the backup configuration, history, and any local repository stored in the excluded directory. When restoring a single root through the API, restic's `--include` filter is used instead, and the excludes do not apply (restic does not allow combining `--include` and `--exclude` in one restore command).
 
-You can restore a full snapshot (all data roots) or a single root (for example, only app_data). During restore, a mutual-exclusion lock prevents concurrent backups or migrations.
+The UI always requests a full snapshot restore, regardless of the root currently open in the file browser. Single-root selection is available only through `POST /api/restore` with the optional `root` field (`app_data`, `app_temp_data`, or `vm_data`). During restore, the operation lock prevents concurrent backups or migrations, but it does not stop running apps or coordinate their file writes. Restoring over live data can race with those writes.
 
-After restoring, you will likely need to reload the affected apps through the Cloud in a Bottle dashboard so they pick up the restored data.
+Restore does not reinstall apps or reconstruct router state. Existing apps may need to be reloaded through the Cloud in a Bottle dashboard to pick up restored files; restoring files alone is not a complete instance recovery procedure.
 
 ## Integrity checks
 
@@ -208,7 +214,7 @@ All persistent state lives in `$OPENHOST_APP_DATA_DIR` (defaults to `/data/app_d
 
 ## Concurrency and timeouts
 
-Only one destructive operation (backup, restore, migration, or the background retention prune) can run at a time. The `OperationLock` in `operations.py` enforces this. `restic check` is also serialized against these operations since it acquires a repository lock. The background prune waits for the lock before running, so it never collides with an in-progress backup or restore.
+Only one lock-taking operation (backup, restore, migration, snapshot deletion, or the background retention prune) can run at a time within this app. The `OperationLock` in `operations.py` enforces this. The background prune waits for this lock and holds it until it finishes. The check route rejects a start while the operation lock is busy, but `restic check --no-lock` holds neither the operation lock nor a restic repository lock. Operations started after the check begins can therefore overlap it.
 
 Timeouts for restic operations:
 
@@ -224,7 +230,7 @@ Timeouts for restic operations:
 
 If a restic process exceeds its timeout, it is killed and the operation is marked as failed.
 
-Read-only commands (`snapshots`, `stats`, `ls`, `cat config`) run with `--no-lock` so concurrent page loads don't contend on the repository lock or leave a stale lock behind if a request is aborted. Lock-taking commands (`backup`, `restore`, `check`, `forget`, `prune`) run with `--retry-lock 1m` so that if another operation is briefly holding the lock, restic waits and retries for up to a minute instead of failing immediately with "repository is already locked". (Both flags require restic ≥ 0.16.)
+Read-only commands (`snapshots`, `stats`, `ls`, `cat config`, `check`) run with `--no-lock` so they do not contend on the repository lock or leave a stale lock behind if a request is aborted. Lock-taking commands (`backup`, `restore`, `forget`, `prune`) run with `--retry-lock 1m` so that if another operation is briefly holding the lock, restic waits and retries for up to a minute instead of failing immediately with "repository is already locked". (Both flags require restic ≥ 0.16.)
 
 Every restic invocation is logged (the command on start, exit code and elapsed time on completion), visible via `oh app logs backup`.
 
