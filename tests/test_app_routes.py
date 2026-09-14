@@ -1208,9 +1208,8 @@ class TestStatusPush:
 
 
 class TestZoneTagging:
-    """New backups carry bottle + zone:<domain>; the snapshot list keeps this
-    zone's snapshots plus legacy (zone-less / openhost-tagged) ones and hides
-    other zones'. Falls back to unscoped when OPENHOST_ZONE_DOMAIN is unset."""
+    """Zone tags identify a backup's source without restricting recovery on
+    another instance. Both current and legacy app tags remain supported."""
 
     ZONE = "samuel.selfhost.imbue.com"
 
@@ -1223,12 +1222,6 @@ class TestZoneTagging:
             "name:nightly",
         ]
 
-    def test_in_scope_keeps_mine_and_legacy_hides_foreign(self, client, monkeypatch):
-        monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
-        assert backup_app._snapshot_in_scope(["bottle", f"zone:{self.ZONE}"])  # mine
-        assert backup_app._snapshot_in_scope(["openhost"])  # legacy, no zone tag
-        assert not backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
-
     def test_has_app_tag_accepts_bottle_and_legacy_openhost(self, client):
         assert backup_app._has_app_tag(["bottle"])
         assert backup_app._has_app_tag(["openhost", "zone:x"])
@@ -1237,14 +1230,13 @@ class TestZoneTagging:
     def test_restic_tag_args_or_bottle_and_openhost(self, client):
         assert backup_app._restic_tag_args() == ["--tag", "bottle", "--tag", "openhost"]
 
-    def test_backup_tags_and_scope_fall_back_when_zone_unset(self, client, monkeypatch):
+    def test_backup_tags_fall_back_when_zone_unset(self, client, monkeypatch):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
         assert backup_app._backup_tags("nightly") == ["bottle", "name:nightly"]
-        # No zone identity -> everything is in scope.
-        assert backup_app._snapshot_in_scope(["openhost", "zone:other.example.com"])
 
-    async def test_list_snapshots_includes_legacy_excludes_foreign(
-        self, client, monkeypatch
+    @pytest.mark.parametrize("foreign_tag", ["bottle", "openhost"])
+    async def test_list_snapshots_includes_other_instances_and_preserves_history(
+        self, client, monkeypatch, foreign_tag
     ):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", self.ZONE)
         conf = backup_app.load_config()
@@ -1257,10 +1249,13 @@ class TestZoneTagging:
             {"id": "b" * 64, "short_id": "b", "time": "2026-01-02T00:00:00Z",
              "tags": ["openhost"]},                                # legacy tag
             {"id": "c" * 64, "short_id": "c", "time": "2026-01-01T00:00:00Z",
-             "tags": ["openhost", "zone:other.example.com"]},      # foreign
+             "tags": [foreign_tag, "zone:other.example.com"],
+             "hostname": "other.example.com"},                     # foreign
             {"id": "d" * 64, "short_id": "d", "time": "2026-01-01T00:00:00Z",
              "tags": ["other"]},                                   # not ours
         ]
+        # A domain change must not make an existing snapshot's history look stale.
+        backup_app.record_backup("t1", "success", snapshot_id="c" * 64)
 
         async def fake_run(args, conf, timeout=None):
             if args and args[0] == "snapshots":
@@ -1268,10 +1263,17 @@ class TestZoneTagging:
             return 0, b"", b""  # cat config probe -> repo exists
 
         with patch.object(backup_app, "_run_restic", new=fake_run):
-            out, ok = await backup_app.list_snapshots()
-        assert ok is True
-        ids = {s["short_id"] for s in out}
-        assert ids == {"a", "b"}  # mine + legacy openhost, foreign/other excluded
+            response = await client.get("/api/snapshots")
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["ok"] is True
+        assert body["repo_ok"] is True
+        out = body["snapshots"]
+        assert [s["short_id"] for s in out] == ["a", "b", "c"]
+        assert out[2]["hostname"] == "other.example.com"
+        assert out[2]["tags"] == [foreign_tag, "zone:other.example.com"]
+        history, _ = backup_app.get_backup_history(limit=10)
+        assert [h["snapshot_id"] for h in history] == ["c" * 64]
 
 
 class TestSnapshotBrowsing:

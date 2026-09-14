@@ -206,7 +206,7 @@
         <!-- Snapshots -->
         <section>
             <h2>Snapshots</h2>
-            <p class="info">Snapshots reported by restic. Click a row to browse files, restore, or delete.</p>
+            <p class="info">Snapshots reported by restic, including backups from other instances. Click a row to browse files, restore, or delete.</p>
             <div class="btn-row" style="margin-bottom: 12px;">
                 <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Refresh snapshots</button>
             </div>
@@ -217,6 +217,7 @@
                             <th style="padding:6px 8px;">Time (UTC)</th>
                             <th style="padding:6px 8px;">ID</th>
                             <th style="padding:6px 8px;">Name</th>
+                            <th style="padding:6px 8px;">Source</th>
                             <th style="padding:6px 8px;text-align:right;" title="Logical size of the files in this snapshot (before dedup/compression)">Snapshot size (uncompressed)</th>
                         </tr>
                     </thead>
@@ -975,7 +976,7 @@
 
             if (!res.ok || !res.repo_ok) {
                 container.style.display = "block";
-                body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
+                body.innerHTML = '<tr><td colspan="5" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 snapshotsAll = [];
                 return;
@@ -985,7 +986,7 @@
 
             if (snapshotsAll.length === 0) {
                 container.style.display = "block";
-                body.innerHTML = '<tr><td colspan="4" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="5" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 return;
             }
@@ -1019,6 +1020,7 @@
             slice.forEach(s => {
                 const rec = snapshotsNameMap[s.id] || snapshotsNameMap[s.short_id] || null;
                 const name = (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
+                const source = (s.tags || []).filter(t => t.startsWith("zone:")).map(t => t.slice(5))[0] || s.hostname || "Unknown";
                 const sizeBytes = rec && rec.total_size_bytes != null ? rec.total_size_bytes : null;
                 const sizeText = sizeBytes != null ? formatBytes(sizeBytes) : "-";
                 const tr = document.createElement("tr");
@@ -1037,6 +1039,7 @@
                     '<td style="padding:6px 8px;">' + escapeHtml(formatDateTime(s.time)) + '</td>' +
                     '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(s.short_id) + '</td>' +
                     '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
+                    '<td style="padding:6px 8px;overflow-wrap:anywhere;">' + escapeHtml(source) + '</td>' +
                     '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>';
                 body.appendChild(tr);
             });

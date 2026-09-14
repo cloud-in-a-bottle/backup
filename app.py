@@ -146,23 +146,6 @@ def _backup_tags(name: str | None = None) -> list[str]:
     return tags
 
 
-def _snapshot_in_scope(tags: list[str]) -> bool:
-    """Whether a snapshot belongs to this zone's view.
-
-    In scope if it carries this zone's tag, OR carries no zone tag at all —
-    the latter covers *legacy* snapshots written before zone tagging existed
-    (and any run where OPENHOST_ZONE_DOMAIN wasn't set). Only snapshots tagged
-    for a *different* zone are hidden. With no zone configured here, everything
-    is in scope. Callers also require ``_has_app_tag`` (``bottle`` or legacy
-    ``openhost``); restic ``--tag`` can't express "has no zone tag".
-    """
-    zone = _zone_tag()
-    if zone is None:
-        return True
-    snapshot_zones = [t for t in tags if t.startswith("zone:")]
-    return not snapshot_zones or zone in snapshot_zones
-
-
 def classify_repo(repo: str) -> dict:
     """Return ``{"type": <label>, "remote": bool, "location": <display>}``.
 
@@ -1023,7 +1006,7 @@ async def run_backup(name: str | None = None) -> bool:
 
 
 async def list_snapshots() -> tuple[list[dict], bool]:
-    """Return (snapshots, repo_ok).
+    """Return (snapshots, repo_ok) for every instance in the configured repo.
 
     Each snapshot entry has: {id, short_id, time, paths, tags, hostname}.
     """
@@ -1041,10 +1024,9 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         logger.info("list_snapshots: %s", init_err)
         return [], False
     try:
-        # Filter to this app's snapshots (bottle or legacy openhost) at restic,
-        # then narrow to this zone in Python: keep this zone's snapshots plus
-        # legacy ones with no zone tag, and drop snapshots belonging to a
-        # *different* zone. See _snapshot_in_scope.
+        # Keep this app's snapshots (bottle or legacy openhost), regardless of
+        # zone: a replacement instance must be able to discover and restore
+        # backups made under the original instance's domain.
         rc, stdout, stderr = await _run_restic(
             ["snapshots", "--json", *_restic_tag_args(), "--no-lock"],
             conf,
@@ -1059,7 +1041,7 @@ async def list_snapshots() -> tuple[list[dict], bool]:
         out = []
         for e in entries:
             tags = e.get("tags", []) or []
-            if not _has_app_tag(tags) or not _snapshot_in_scope(tags):
+            if not _has_app_tag(tags):
                 continue
             out.append(
                 {
