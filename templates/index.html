@@ -166,7 +166,9 @@
             <details class="scope-block">
                 <summary>What is and isn't backed up</summary>
                 <p class="info" style="margin-top:8px;">
-                    Snapshots capture the paths below. Excluded paths
+                    Snapshots capture the included paths below when present
+                    in this container. Standard mounts do not include router
+                    state or host SSH keys. Excluded paths
                     are intentionally not in the snapshot pipeline —
                     restoring a snapshot will not bring back their
                     contents.
@@ -179,7 +181,7 @@
                             <li>
                                 <code>{{ entry.path }}</code>
                                 {% if not entry.present %}
-                                <span class="scope-tag scope-tag-missing" title="Mount not granted on this instance; the backup loop skips it silently.">not granted on this instance</span>
+                                <span class="scope-tag scope-tag-missing" title="Directory not present in this container; the backup loop skips it silently.">not present in this container</span>
                                 {% endif %}
                             </li>
                             {% endfor %}
@@ -443,7 +445,7 @@
         // and the Status panel can never disagree about which paths
         // are excluded.  Each entry carries ``user_facing`` so the
         // snapshots-browser note can skip implementation-detail
-        // exclusions (e.g. the backup app's own restic repo dir)
+        // exclusions (e.g. the backup app's own data dir)
         // without the JS having to know which path that is.
         const EXCLUDED_ENTRIES = {{ scope.excluded | tojson }};
         let selectedSnapshotId = null;
@@ -1260,7 +1262,7 @@
 
         async function triggerRestore() {
             if (!selectedSnapshotId) return;
-            if (!confirm("This will overwrite current app data with the selected snapshot. Continue?")) return;
+            if (!confirm("This will overwrite files across all captured data roots with the selected snapshot. Continue?")) return;
 
             const btn = document.getElementById("btn-restore");
             btn.disabled = true;
