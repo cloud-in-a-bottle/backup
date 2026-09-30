@@ -537,15 +537,22 @@ class RecoverySession:
         if app is not None:
             app["launch_attempts"] += 1
 
-    async def _reload(self, name: str, app_id: str) -> str:
-        self._count_launch(name)
+    async def _request_reload(self, app_id: str) -> None:
+        """POST a same-identity reload, refusing to widen grants or fetch other source.
+
+        A timeout/invalid success can hide a running worker; those are
+        reconciled against the same identity rather than retried as a new
+        reload. A 4xx is a refusal and must surface.
+        """
         try:
             _require_ok(await self._client.post(f"/reload_app/{app_id}", {"update": False}))
         except ConfigurationError as error:
-            # A timeout/invalid success can hide a running worker. Reconcile the
-            # same identity; never retry reload or turn it into an add_app call.
             if error.status_code is not None and 400 <= error.status_code < 500:
                 raise
+
+    async def _reload(self, name: str, app_id: str) -> str:
+        self._count_launch(name)
+        await self._request_reload(app_id)
         try:
             return await self._wait_running(name, app_id)
         except ConfigurationError as error:
@@ -559,11 +566,7 @@ class RecoverySession:
             if error.code != "deployment_failed":
                 raise
         self._count_launch(name)
-        try:
-            _require_ok(await self._client.post(f"/reload_app/{app_id}", {"update": False}))
-        except ConfigurationError as error:
-            if error.status_code is not None and 400 <= error.status_code < 500:
-                raise
+        await self._request_reload(app_id)
         return await self._wait_running(name, app_id)
 
     async def _install(self, name: str) -> str:
@@ -692,7 +695,7 @@ class RecoverySession:
                 await self._reload(name, app_id)
             else:
                 result["action"] = "install"
-                result["launch_attempts"] += 1
+                self._count_launch(name)
                 app_id = await self._install(name)
             result.update(app_id=app_id, status="running", outcome="restored", ok=True)
             self._ready.add(name)
@@ -787,11 +790,14 @@ class RecoverySession:
             result["status"] = app["status"]
             recorded_stopped = (self._runtime is not None and self._runtime["apps"][name]["status"] == "stopped")
             expected_state = "stopped" if recorded_stopped and states_final else "running"
-            if app["status"] in _CONVERGING_STATUSES:
+            if expected_state == "running" and app["status"] in _CONVERGING_STATUSES:
                 # Still building or starting: the launch is in progress, so this
-                # is a pending outcome, not a failed deployment.
+                # is a pending outcome, not a failed deployment. This is the
+                # dominant fact about the app; do not let a later permission
+                # comparison overwrite it while the launch is unfinished.
                 fail(name, "deployment_pending")
-            elif app["status"] != expected_state:
+                continue
+            if app["status"] != expected_state:
                 fail(name, "deployment_failed")
             if self._runtime is not None:
                 desired = {_record_key(g) for g in self._runtime["apps"][name]["global_grants"]}

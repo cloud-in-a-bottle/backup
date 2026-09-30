@@ -546,6 +546,72 @@ async def test_app_still_converging_at_the_ceiling_is_pending_not_failed(mock_ht
     assert not any("An app deployment failed" in warning for warning in pending["warnings"])
 
 
+async def test_final_validation_keeps_a_converging_app_pending(mock_http):
+    """The final boundary must not overwrite pending with a permissions verdict.
+
+    An app that is still building or starting has not finished; that stays the
+    dominant fact even if its grant rows are not yet visible in the router.
+    """
+    bundle = make_bundle("notes", runtime=True)
+    add_global(bundle, "notes", SECRETS, {"key": "DB_URL"})
+    router = Router(bundle, [inventory_entry("notes", "N" * 12)])
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    assert (await session.activate())["ok"] is True
+    original = Router.handle
+
+    def handle(self, method, path, body):
+        if method == "GET" and path == "/api/apps":
+            self.apps["notes"]["status"] = "starting"
+        if method == "GET" and path == "/api/permissions/v2":
+            return httpx.Response(200, json=[])
+        return original(self, method, path, body)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(Router, "handle", handle)
+    try:
+        await session._validate_completion(states_final=True)
+    finally:
+        monkey.undo()
+    global_warnings, notes = session.progress["warnings"], session.progress["apps"][0]
+    assert notes["outcome"] == "pending", global_warnings
+    assert any("still building or starting" in w for w in notes["warnings"])
+    assert not any("permissions" in w or "deployment failed" in w for w in notes["warnings"])
+
+
+async def test_final_validation_never_calls_a_stopped_bound_app_pending(mock_http):
+    """The converging shortcut applies only when the app is meant to run.
+
+    A recorded-stopped app observed still starting at the final boundary is
+    missing its intended stopped state, which is a failure, not a pending start.
+    """
+    bundle = make_bundle("notes", runtime=True)
+    bundle["runtime"]["apps"]["notes"]["status"] = "stopped"
+    router = Router(bundle, [inventory_entry("notes", "N" * 12)])
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    assert (await session.activate())["ok"] is True
+    original = Router.handle
+
+    def handle(self, method, path, body):
+        if method == "GET" and path == "/api/apps":
+            self.apps["notes"]["status"] = "starting"
+        return original(self, method, path, body)
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(Router, "handle", handle)
+    try:
+        await session._validate_completion(states_final=True)
+    finally:
+        monkey.undo()
+    notes = session.progress["apps"][0]
+    assert notes["outcome"] == "failed"
+    assert any("An app deployment failed" in w for w in notes["warnings"])
+    assert not any("still building or starting" in w for w in notes["warnings"])
+
+
 @pytest.mark.parametrize("change", [
     lambda a: a["source"].update(repo_url="https://example.com/different/private-repo.git"),
     lambda a: a["source"].update(ref="different-private-ref"),
