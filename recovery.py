@@ -540,9 +540,9 @@ class RecoverySession:
     async def _request_reload(self, app_id: str) -> None:
         """POST a same-identity reload, refusing to widen grants or fetch other source.
 
-        A timeout/invalid success can hide a running worker; those are
-        reconciled against the same identity rather than retried as a new
-        reload. A 4xx is a refusal and must surface.
+        Only a 4xx refusal surfaces here. A lost or late response is left for
+        the caller's wait-on-same-identity to reconcile against the existing
+        app, so the identity is never replaced or retried as a new reload.
         """
         try:
             _require_ok(await self._client.post(f"/reload_app/{app_id}", {"update": False}))
@@ -792,9 +792,10 @@ class RecoverySession:
             expected_state = "stopped" if recorded_stopped and states_final else "running"
             if expected_state == "running" and app["status"] in _CONVERGING_STATUSES:
                 # Still building or starting: the launch is in progress, so this
-                # is a pending outcome, not a failed deployment. This is the
-                # dominant fact about the app; do not let a later permission
-                # comparison overwrite it while the launch is unfinished.
+                # is a pending outcome, not a failed deployment. It stays the
+                # dominant fact for this app: the permission comparison is left
+                # undone until the launch actually settles, so a grant that has
+                # not been confirmed yet cannot be reported as the failure.
                 fail(name, "deployment_pending")
                 continue
             if app["status"] != expected_state:

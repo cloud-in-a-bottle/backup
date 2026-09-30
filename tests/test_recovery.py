@@ -1134,6 +1134,7 @@ async def test_accepted_install_does_not_count_as_complete_without_running(mock_
     result = await session.activate()
     assert result["ok"] is False and result["apps"][0]["ok"] is False
     assert result["apps"][0]["outcome"] == outcome
+    assert result["apps"][0]["launch_attempts"] == 1, "The install attempt is counted through the shared launch counter"
     assert any(fragment in warning for warning in result["apps"][0]["warnings"])
     assert OWNER_TOKEN not in json.dumps(result) and VERIFIER not in json.dumps(result)
 
