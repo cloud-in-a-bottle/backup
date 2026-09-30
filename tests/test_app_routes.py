@@ -1,16 +1,13 @@
-"""Integration tests for app.py HTTP routes related to migration.
+"""Quart route, cache, retention, and backup scope regressions.
 
-Tests the Quart routes for the migration receive endpoints using the
-Quart test client.
+Migration protocol HTTP coverage lives in test_app_migration_v4.py.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import os
-import tarfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,192 +18,63 @@ os.environ.setdefault("OPENHOST_APP_DATA_DIR", "/tmp/test_backup_data")
 os.environ.setdefault("OPENHOST_APP_BASE_PATH", "/backup")
 
 import app as backup_app
+from tests.test_configuration import make_bundle
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     """Create a Quart test client with isolated data directories."""
-    # Save originals so we can restore them after the test — other
-    # test modules (test_excludes.py) rely on the module-level
-    # constants retaining their import-time values.
-    orig = {
-        "ALL_APP_DATA": backup_app.ALL_APP_DATA,
-        "APP_DATA_DIR": backup_app.APP_DATA_DIR,
-        "CONFIG_DIR": backup_app.CONFIG_DIR,
-        "DB_FILE": backup_app.DB_FILE,
-        "CONFIG_FILE": backup_app.CONFIG_FILE,
-        "RESTIC_REPO_DIR": backup_app.RESTIC_REPO_DIR,
+    root = tmp_path / "app_data"
+    own_data = root / backup_app.APP_NAME
+    own_data.mkdir(parents=True)
+    temp = tmp_path / "app_temp_data"
+    temp.mkdir()
+    paths = {
+        "ALL_APP_DATA": root,
+        "APP_DATA_DIR": own_data,
+        "APP_TEMP_DATA": temp,
+        "APP_ARCHIVE": tmp_path / "app_archive",
+        "VM_DATA_DIR": tmp_path / "vm_data",
+        "CONFIG_DIR": own_data,
+        "DB_FILE": own_data / "backups.db",
+        "CONFIG_FILE": own_data / "config.json",
+        "RESTIC_REPO_DIR": own_data / "restic-repo",
     }
-
-    # Override paths so tests don't touch real data
-    backup_app.ALL_APP_DATA = tmp_path / "app_data"
-    backup_app.ALL_APP_DATA.mkdir()
-    backup_app.APP_DATA_DIR = tmp_path / "backup_data"
-    backup_app.APP_DATA_DIR.mkdir()
-    backup_app.CONFIG_DIR = backup_app.APP_DATA_DIR
-    backup_app.DB_FILE = backup_app.APP_DATA_DIR / "backups.db"
-    backup_app.CONFIG_FILE = backup_app.APP_DATA_DIR / "config.json"
-    backup_app.RESTIC_REPO_DIR = backup_app.APP_DATA_DIR / "restic-repo"
-
-    # Init DB
+    for name, value in paths.items():
+        monkeypatch.setattr(backup_app, name, value)
+    monkeypatch.setattr(backup_app, "BACKUP_ROOTS", (root, temp))
+    monkeypatch.setattr(backup_app, "BACKUP_EXCLUDES", (
+        own_data, temp / backup_app.APP_NAME, paths["APP_ARCHIVE"],
+        root / backup_app.RESTORE_WORK_NAME, temp / backup_app.RESTORE_WORK_NAME,
+    ))
+    monkeypatch.setattr(backup_app, "_ROOT_NAMES", {
+        "app_data": root, "app_temp_data": temp, "vm_data": paths["VM_DATA_DIR"],
+    })
+    for name, value in {
+        "op_lock": backup_app.OperationLock(),
+        "_migration_receiver": None,
+        "_restore_session": None,
+        "_restore_needs_attention": False,
+        "restore_last_snapshot": None,
+        "restore_last_status": None,
+        "restore_progress": None,
+        "check_last_status": None,
+        "check_last_output": None,
+        "check_last_at": None,
+        "check_running": False,
+        "_background_tasks": set(),
+        "_status_subscribers": set(),
+        "_init_lock": asyncio.Lock(),
+        "ROUTER_API_TOKEN": "",
+        "APP_TOKEN": "test-app-token",
+    }.items():
+        monkeypatch.setattr(backup_app, name, value)
+    monkeypatch.setattr(backup_app.migration, "status", None)
+    monkeypatch.setattr(backup_app.migration, "log", [])
+    # Startup owns this record; tests install their own explicitly.
+    monkeypatch.setattr(backup_app.migration, "source_recovery", None)
     backup_app.init_db()
-
     yield backup_app.app.test_client()
-
-    # Restore original module globals.
-    for attr, val in orig.items():
-        setattr(backup_app, attr, val)
-
-
-def _make_tar_gz(contents: dict[str, bytes]) -> bytes:
-    """Create a tar.gz in memory with the given path->content mapping."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for name, data in contents.items():
-            info = tarfile.TarInfo(name=name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
-
-
-class TestReceiveDataEndpoint:
-    """Tests for POST /api/migration/receive/data."""
-
-    async def test_empty_body_returns_400(self, client):
-        response = await client.post(
-            "/api/migration/receive/data",
-            data=b"",
-            headers={"Content-Type": "application/gzip"},
-        )
-        assert response.status_code == 400
-        data = await response.get_json()
-        assert data["ok"] is False
-        assert "Empty" in data["error"]
-
-    async def test_valid_tar_extracts_apps(self, client, tmp_path):
-        tar_data = _make_tar_gz(
-            {
-                "myapp/config.json": b'{"key": "value"}',
-                "myapp/data.db": b"database content",
-                "secrets/sqlite/main.db": b"secret data",
-            }
-        )
-        response = await client.post(
-            "/api/migration/receive/data",
-            data=tar_data,
-            headers={"Content-Type": "application/gzip"},
-        )
-        assert response.status_code == 200
-        data = await response.get_json()
-        assert data["ok"] is True
-        assert "myapp" in data.get("apps", [])
-        assert "secrets" in data.get("apps", [])
-
-        # Verify files were extracted
-        assert (backup_app.ALL_APP_DATA / "myapp" / "config.json").exists()
-        assert (backup_app.ALL_APP_DATA / "secrets" / "sqlite" / "main.db").exists()
-
-    async def test_corrupt_tar_returns_error(self, client):
-        response = await client.post(
-            "/api/migration/receive/data",
-            data=b"not a tar file at all",
-            headers={"Content-Type": "application/gzip"},
-        )
-        assert response.status_code == 400
-        data = await response.get_json()
-        assert data["ok"] is False
-
-
-class TestReceiveStartEndpoint:
-    """Tests for POST /api/migration/receive/start."""
-
-    async def test_missing_manifest_returns_400(self, client):
-        # Reset op_lock
-        backup_app.op_lock._active = None
-
-        response = await client.post(
-            "/api/migration/receive/start",
-            data=json.dumps({}),
-            headers={"Content-Type": "application/json"},
-        )
-        # Empty manifest -> receive_start returns error -> 400
-        data = await response.get_json()
-        assert data["ok"] is False
-
-    async def test_valid_manifest_accepted(self, client):
-        backup_app.op_lock._active = None
-
-        manifest = {
-            "version": 3,
-            "apps": [{"name": "testapp"}],
-            "source_instance": "test.example.com",
-        }
-        response = await client.post(
-            "/api/migration/receive/start",
-            data=json.dumps(manifest),
-            headers={"Content-Type": "application/json"},
-        )
-        assert response.status_code == 200
-        data = await response.get_json()
-        assert data["ok"] is True
-        assert "testapp" in data["accepted_apps"]
-
-        # Clean up lock
-        if backup_app.op_lock.active:
-            backup_app.op_lock.release(backup_app.op_lock.active)
-
-    async def test_lock_conflict_returns_409(self, client):
-        from operations import OpKind
-
-        backup_app.op_lock._active = OpKind.BACKUP
-
-        manifest = {"apps": [{"name": "testapp"}]}
-        response = await client.post(
-            "/api/migration/receive/start",
-            data=json.dumps(manifest),
-            headers={"Content-Type": "application/json"},
-        )
-        assert response.status_code == 409
-
-        # Clean up
-        backup_app.op_lock._active = None
-
-
-class TestReceiveFinalizeEndpoint:
-    """Tests for POST /api/migration/receive/finalize."""
-
-    async def test_missing_manifest_returns_400(self, client):
-        backup_app.op_lock._active = None
-
-        response = await client.post(
-            "/api/migration/receive/finalize",
-            data=json.dumps({}),
-            headers={"Content-Type": "application/json"},
-        )
-        data = await response.get_json()
-        assert data["ok"] is False
-        assert "Missing" in data.get("error", "")
-
-    @patch("migration._router_post")
-    async def test_finalize_with_manifest(self, mock_post, client):
-        from operations import OpKind
-
-        backup_app.op_lock._active = OpKind.MIGRATION
-        mock_post.return_value = {"ok": True}
-
-        manifest = {
-            "apps": [{"name": "testapp", "status": "running"}],
-        }
-        response = await client.post(
-            "/api/migration/receive/finalize",
-            data=json.dumps({"manifest": manifest}),
-            headers={"Content-Type": "application/json"},
-        )
-        data = await response.get_json()
-        assert data["ok"] is True
-
-        # Lock should be released after finalize
-        assert backup_app.op_lock.active is None
 
 
 class TestAppsStatusEndpoint:
@@ -279,6 +147,34 @@ class TestStopAllAppsEndpoint:
         assert "agent" not in data["stopped"]  # already stopped
         backup_app.ROUTER_API_TOKEN = ""
 
+    @patch("app._get_router_apps")
+    async def test_a_renamed_app_never_stops_itself(self, mock_get, client, monkeypatch):
+        # The app's own name is configurable, so self-exclusion must follow the
+        # deployed name: a renamed instance would otherwise stop itself (or
+        # offer itself as a migration target) on the way to its own data.
+        monkeypatch.setattr(backup_app, "APP_NAME", "snapshot-vault")
+        mock_get.return_value = {
+            "snapshot-vault": {"app_id": "id-self", "status": "running"},
+            "backup": {"app_id": "id-backup", "status": "running"},
+            "agent": {"app_id": "id-agent", "status": "running"},
+        }
+        mock_client = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+        mock_client.post.return_value = mock_response
+        backup_app.ROUTER_API_TOKEN = "test-token"
+        try:
+            with patch("httpx.AsyncClient") as mock_cls:
+                mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+                response = await client.post("/api/stop-all-apps")
+        finally:
+            backup_app.ROUTER_API_TOKEN = ""
+        data = await response.get_json()
+        assert data["stopped"] == ["backup", "agent"]
+        running = await backup_app._running_selected_apps("test-token", None)
+        assert running == ["backup", "agent"]
+
     async def test_stops_partial_selected_apps(self, client):
         """Stop endpoint only stops requested apps when apps filter is provided."""
         mock_apps_resp = MagicMock()
@@ -307,98 +203,6 @@ class TestStopAllAppsEndpoint:
         assert data["stopped"] == ["app1"]
         stop_urls = [c.args[0] for c in mock_client.post.call_args_list]
         assert stop_urls == [f"{backup_app.ROUTER_URL}/stop_app/id-app1"]
-        backup_app.ROUTER_API_TOKEN = ""
-
-
-class TestMigrationPushEndpoint:
-    """Tests for POST /api/migration/push."""
-
-    async def test_rejects_when_target_missing_backup_app(self, client):
-        """Preflight fails cleanly when the destination 404s (backup app not installed)."""
-        local_resp = MagicMock()
-        local_resp.status_code = 200
-        local_resp.headers = {"content-type": "application/json"}
-
-        target_resp = MagicMock()
-        target_resp.status_code = 404
-        target_resp.headers = {"content-type": "application/json"}
-
-        async def fake_get(url, **kwargs):
-            return target_resp if "backup." in url else local_resp
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=fake_get)
-
-        backup_app.ROUTER_API_TOKEN = "test-token"
-        with patch("httpx.AsyncClient") as mock_cls:
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-            response = await client.post(
-                "/api/migration/push",
-                json={"target_url": "https://myzone.example.com", "target_token": "tok"},
-            )
-        data = await response.get_json()
-        assert data["ok"] is False
-        assert "not installed" in data["error"]
-        backup_app.ROUTER_API_TOKEN = ""
-
-    @patch("app._get_router_apps")
-    async def test_rejects_when_selected_apps_still_running(self, mock_get, client):
-        """Push refuses to start while a targeted app is up, and frees the lock."""
-        mock_get.return_value = {
-            "app1": {"status": "running"},
-            "app2": {"status": "stopped"},
-            "backup": {"status": "running"},
-        }
-        backup_app.ROUTER_API_TOKEN = "test-token"
-        response = await client.post(
-            "/api/migration/push",
-            json={
-                "target_url": "https://myzone.example.com",
-                "target_token": "tok",
-                "apps": ["app1", "app2"],
-            },
-        )
-        assert response.status_code == 409
-        data = await response.get_json()
-        assert data["ok"] is False
-        # backup is never reported: it serves this request and can't be stopped.
-        assert "app1" in data["error"] and "backup" not in data["error"]
-        assert not backup_app.op_lock.migration_running
-        backup_app.ROUTER_API_TOKEN = ""
-
-    @patch("app._get_router_apps")
-    async def test_allows_start_when_selected_apps_stopped(self, mock_get, client):
-        """A running app outside the selection does not block the migration."""
-        mock_get.return_value = {
-            "app1": {"status": "stopped"},
-            "app2": {"status": "running"},
-        }
-
-        target_resp = MagicMock()
-        target_resp.status_code = 200
-        target_resp.headers = {"content-type": "application/json"}
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=target_resp)
-
-        backup_app.ROUTER_API_TOKEN = "test-token"
-        with (
-            patch("httpx.AsyncClient") as mock_cls,
-            patch("migration.run_direct_push", new=AsyncMock()),
-        ):
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-            response = await client.post(
-                "/api/migration/push",
-                json={
-                    "target_url": "https://myzone.example.com",
-                    "target_token": "tok",
-                    "apps": ["app1"],
-                },
-            )
-        data = await response.get_json()
-        assert data["ok"] is True
-        backup_app.op_lock.release(backup_app.OpKind.MIGRATION)
         backup_app.ROUTER_API_TOKEN = ""
 
 
@@ -880,6 +684,13 @@ class TestIndexRendersScope:
     deploy.
     """
 
+    async def test_index_tells_the_browser_its_own_configured_name(self, client, monkeypatch):
+        # The page filters this app out of the migration target list, so it has
+        # to be told the deployed name rather than assuming the default.
+        monkeypatch.setattr(backup_app, "APP_NAME", "snapshot-vault")
+        body = (await (await client.get("/")).get_data()).decode()
+        assert 'const APP_NAME = "snapshot-vault";' in body
+
     async def test_index_renders_archive_exclusion_in_status_panel(self, client):
         """The Status panel's <details> block must mention
         ``/data/app_archive`` and explain the exclusion in
@@ -887,12 +698,15 @@ class TestIndexRendersScope:
         future template refactor that drops the panel fails this
         test rather than silently shipping a less-informative UI.
         """
+        conf = backup_app.load_config()
+        conf["repo"] = str(backup_app.RESTIC_REPO_DIR)
+        backup_app.save_config(conf)
         resp = await client.get("/")
         assert resp.status_code == 200
         body = (await resp.get_data()).decode()
-        assert "What is and isn't backed up" in body
-        assert "/data/app_archive" in body
-        assert "intentionally excluded" in body or "intentionally not captured" in body
+        panel = body.split("What is and isn't backed up", 1)[1].split("</details>", 1)[0]
+        assert str(backup_app.APP_ARCHIVE) in panel
+        assert "intentionally excluded" in panel or "intentionally not captured" in panel
 
     async def test_index_renders_archive_exclusion_in_migrate_section(self, client):
         """The Migrate tab's "Important details" callout also names
@@ -902,16 +716,9 @@ class TestIndexRendersScope:
         resp = await client.get("/")
         assert resp.status_code == 200
         body = (await resp.get_data()).decode()
-        # Both the migrate callout and the file-browser note should
-        # reference the archive path; this asserts the migrate path
-        # specifically by anchoring on the surrounding migrate copy.
-        assert "Not migrated" in body
-        # The migrate paragraph itself names the archive path within
-        # the same DOM node, which is how the operator sees it.
-        idx = body.find("Not migrated")
-        # Allow up to ~600 chars after "Not migrated" for the rest of
-        # the paragraph to mention the archive path.
-        assert "/data/app_archive" in body[idx : idx + 1200]
+        details = body.split('id="page-migrate"', 1)[1].split("</details>", 1)[0]
+        assert str(backup_app.APP_ARCHIVE) in details
+        assert "intentionally excluded" in details
 
     async def test_index_renders_every_backup_root(self, client):
         """Every BACKUP_ROOTS path must appear in the rendered page.
@@ -925,6 +732,28 @@ class TestIndexRendersScope:
         body = (await resp.get_data()).decode()
         for root in backup_app.BACKUP_ROOTS:
             assert str(root) in body, f"missing BACKUP_ROOTS path {root}"
+
+    def test_new_backup_policy_excludes_vm_data_and_internal_staging(self):
+        # No client fixture: pin the actual production constants, not the sandbox copies.
+        assert backup_app.BACKUP_ROOTS == (backup_app.ALL_APP_DATA, backup_app.APP_TEMP_DATA)
+        assert set(backup_app.BACKUP_EXCLUDES) == {
+            backup_app.ALL_APP_DATA / backup_app.APP_NAME,
+            backup_app.APP_TEMP_DATA / backup_app.APP_NAME,
+            backup_app.APP_ARCHIVE,
+            backup_app.ALL_APP_DATA / backup_app.RESTORE_WORK_NAME,
+            backup_app.APP_TEMP_DATA / backup_app.RESTORE_WORK_NAME,
+        }
+
+    def test_scope_summary_hides_internal_exclusions(self, client):
+        summary = backup_app._backup_scope_summary()
+        assert {entry["path"] for entry in summary["included"]} == {
+            str(backup_app.ALL_APP_DATA), str(backup_app.APP_TEMP_DATA),
+        }
+        excluded = {entry["path"]: entry for entry in summary["excluded"]}
+        assert set(excluded) == {str(path) for path in backup_app.BACKUP_EXCLUDES}
+        assert {path for path, entry in excluded.items() if entry["user_facing"]} == {
+            str(backup_app.APP_ARCHIVE),
+        }
 
 
 class TestRepoStatsCache:
@@ -1416,10 +1245,17 @@ class TestRetention:
             backup_app, "ensure_repo_initialized", AsyncMock(return_value=(True, None))
         )
         monkeypatch.setattr(backup_app, "repo_stats", AsyncMock(return_value=(None, None)))
+        bundle = make_bundle("myapp", runtime=True)
+        capture = AsyncMock(return_value=bundle)
+        monkeypatch.setattr(backup_app, "capture_configuration", capture)
+        metadata = backup_app.APP_DATA_DIR.parent.parent / "private-metadata" / "configuration.json"
+        monkeypatch.setattr(backup_app.snapshot_configuration, "CONFIGURATION_FILE", metadata)
         captured = {}
 
         async def fake_run_restic(args, conf, timeout=None):
             captured["args"] = args
+            assert json.loads(metadata.read_bytes()) == bundle
+            assert metadata.stat().st_mode & 0o777 == 0o600
             summary = json.dumps(
                 {
                     "message_type": "summary",
@@ -1438,6 +1274,19 @@ class TestRetention:
         assert args[0] == "backup"
         assert args[args.index("--host") + 1] == backup_app.BACKUP_HOST
         assert args[args.index("--retry-lock") + 1] == backup_app.RETRY_LOCK
+        capture.assert_awaited_once_with(
+            backup_app.ROUTER_URL, backup_app.APP_TOKEN, None, backup_app.APP_NAME
+        )
+        assert str(metadata) in args
+        assert backup_app.snapshot_configuration.CONFIGURATION_TAG in args
+        assert backup_app.snapshot_configuration.RUNTIME_TAG in args
+        assert not metadata.exists()
+        excludes = {args[i + 1] for i, arg in enumerate(args) if arg == "--exclude"}
+        assert str(backup_app.APP_DATA_DIR) in excludes
+        assert str(backup_app.APP_TEMP_DATA / backup_app.APP_NAME) in excludes
+        assert str(backup_app.ALL_APP_DATA / backup_app.RESTORE_WORK_NAME) in excludes
+        assert str(backup_app.APP_TEMP_DATA / backup_app.RESTORE_WORK_NAME) in excludes
+        assert str(backup_app.VM_DATA_DIR) not in args
 
     async def test_run_retention_forgets_and_reconciles_db(self, client):
         backup_app.record_backup("t1", "success", snapshot_id="a" * 64)

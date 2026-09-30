@@ -6,11 +6,11 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
-RUN uv sync
+RUN uv sync --frozen --no-dev
 
-COPY app.py migration.py operations.py ./
+COPY app.py migration.py migration_data.py operations.py configuration.py recovery.py snapshot_configuration.py restic_process.py ./
 COPY templates/ templates/
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "echo 'Starting hypercorn...' && uv run hypercorn -b 0.0.0.0:8080 app:app"]
+CMD ["/app/.venv/bin/hypercorn", "-b", "0.0.0.0:8080", "app:app"]

@@ -1,7 +1,7 @@
 [app]
 name = "backup"
-version = "0.1.0"
-description = "User-controlled incremental backups of app data via restic"
+version = "0.2.0"
+description = "Encrypted backups and recovery of app data, configuration, and API keys"
 
 [runtime]
 type = "serverfull"
@@ -16,3 +16,9 @@ cpu_cores = 1.0
 
 [data]
 access_all_app_data = true
+
+[[services.v2.consumes]]
+service = "github.com/cloud-in-a-bottle/cloud-in-a-bottle/services/app-definitions"
+shortname = "definitions"
+version = ">=0.1.0,<0.2.0"
+grants = [{ mode = "private" }]

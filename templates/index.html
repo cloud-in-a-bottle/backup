@@ -10,7 +10,7 @@
         h1 { font-size: 2rem; margin-bottom: 0; }
         h2 { font-size: 1.5rem; margin-bottom: 12px; color: #333; }
         h3 { font-size: 1.0rem; margin-bottom: 12px; color: #333; }
-        section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+        section { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin-bottom: 20px; overflow-wrap: anywhere; }
         label { display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; color: #555; }
         input[type="text"], input[type="number"], input[type="password"] {
             width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px;
@@ -42,12 +42,14 @@
         .status-error { background: #fee2e2; color: #991b1b; }
         .status-warning { background: #fef3c7; color: #92400e; }
         .status-running { background: #dbeafe; color: #1e40af; }
-        .status-none { background: #f3f4f6; color: #6b7280; }
+        .status-none { background: #f3f4f6; color: #4b5563; }
         .status-restore { background: #fef3c7; color: #92400e; }
         .info { font-size: 0.85rem; color: #666; margin-bottom: 12px; line-height: 1.5; }
         .msg { font-size: 0.85rem; margin-top: 8px; padding: 8px; border-radius: 4px; }
         .msg-ok { background: #dcfce7; color: #166534; }
         .msg-err { background: #fee2e2; color: #991b1b; }
+        .msg-pending { background: #dbeafe; color: #1e40af; }
+        .msg-warning { background: #fef3c7; color: #92400e; }
         dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; font-size: 0.9rem; }
         dt { font-weight: 600; color: #555; }
         .browse-link { color: #2563eb; cursor: pointer; text-decoration: underline; }
@@ -86,9 +88,22 @@
         .tab-btn.active { color: #2563eb; border-bottom-color: #2563eb; }
         .page { display: none; }
         .page.active { display: block; }
+        :focus-visible { outline: 3px solid #2563eb; outline-offset: 3px; }
+        .table-scroll { overflow-x: auto; }
+        .recovery-details { font-size: 0.85rem; line-height: 1.6; overflow-wrap: anywhere; }
+        .recovery-details ul { padding-left: 20px; }
+        .browse-link { background: transparent; padding: 2px; font: inherit; }
+        @media (max-width: 480px) {
+            body { padding: 12px; }
+            section { padding: 12px; }
+            dl, dl.scope-list { grid-template-columns: 1fr; }
+            dd { margin-bottom: 8px; min-width: 0; }
+            input { min-width: 0; }
+        }
     </style>
 </head>
 <body>
+    <main>
     <h1>Backup</h1>
 
     <!-- Permanent operation banner. Reflects op_lock state from /api/status
@@ -97,10 +112,10 @@
          pollLockBanner(); hidden while idle. -->
     <div id="lock-banner" role="status" aria-live="polite" style="display:none;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:0.9rem;color:#92400e;font-weight:500;"></div>
 
-    <div class="tab-bar">
-        <button class="tab-btn active" onclick="showPage('backup')">Backups</button>
+    <nav class="tab-bar" aria-label="Backup pages">
+        <button class="tab-btn active" aria-current="page" onclick="showPage('backup')">Backups</button>
         <button class="tab-btn" onclick="showPage('migrate')">Migrate</button>
-    </div>
+    </nav>
 
     <!-- ============================================================
          PAGE: Backups
@@ -166,12 +181,9 @@
             <details class="scope-block">
                 <summary>What is and isn't backed up</summary>
                 <p class="info" style="margin-top:8px;">
-                    Snapshots capture the included paths below when present
-                    in this container. Standard mounts do not include router
-                    state or host SSH keys. Excluded paths
-                    are intentionally not in the snapshot pipeline —
-                    restoring a snapshot will not bring back their
-                    contents.
+                    New snapshots capture persistent and temporary app data plus private app definitions and API-key verifier records in the same encrypted snapshot.
+                    Standard mounts do not include the router database or host SSH keys. Archive data and the backup app's own storage are excluded.
+                    Backups read live files: arrange application-consistent database backups when needed.
                 </p>
                 <dl class="scope-list">
                     <dt>Included</dt>
@@ -194,7 +206,7 @@
                             <li>
                                 <code>{{ entry.path }}</code>
                                 {% if entry.reason %}
-                                <span class="scope-reason">— {{ entry.reason }}</span>
+                                <span class="scope-reason">: {{ entry.reason }}</span>
                                 {% endif %}
                             </li>
                             {% endfor %}
@@ -208,18 +220,19 @@
         <!-- Snapshots -->
         <section>
             <h2>Snapshots</h2>
-            <p class="info">Snapshots reported by restic, including backups from other instances. Click a row to browse files, restore, or delete.</p>
+            <p class="info">Select a snapshot to browse files, restore, or delete. Legacy snapshots recover files only; they cannot recreate missing app definitions or API keys.</p>
             <div class="btn-row" style="margin-bottom: 12px;">
                 <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Refresh snapshots</button>
             </div>
-            <div id="snapshots-container" style="display:none;">
+            <div id="snapshots-container" class="table-scroll" role="region" aria-label="Snapshots" tabindex="0" style="display:none;">
                 <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-bottom:8px;">
                     <thead>
                         <tr style="border-bottom:2px solid #ddd;text-align:left;">
                             <th style="padding:6px 8px;">Time (UTC)</th>
                             <th style="padding:6px 8px;">ID</th>
                             <th style="padding:6px 8px;">Name</th>
-                            <th style="padding:6px 8px;">Source</th>
+                             <th style="padding:6px 8px;">Source</th>
+                             <th style="padding:6px 8px;">Recovery scope</th>
                             <th style="padding:6px 8px;text-align:right;" title="Logical size of the files in this snapshot (before dedup/compression)">Snapshot size (uncompressed)</th>
                         </tr>
                     </thead>
@@ -235,13 +248,14 @@
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                     <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
                 </div>
+                <p class="info" id="selected-snapshot-scope"></p>
                 <div class="btn-row">
                     <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot(null, '')">Browse</button>
                     <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                     <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
                 </div>
             </div>
-            <div id="browse-container" style="display:none;margin-top:12px;">
+            <div id="browse-container" class="table-scroll" style="display:none;margin-top:12px;">
                 <div id="browse-breadcrumb" style="font-size:0.85rem;margin-bottom:8px;font-family:monospace;"></div>
                 <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
                     <thead>
@@ -254,14 +268,20 @@
                     <tbody id="browse-body"></tbody>
                 </table>
             </div>
-            <div id="restore-state" style="margin-top:12px;"></div>
-            <div id="manage-msg"></div>
+            <div id="restore-state" role="status" aria-live="polite" style="margin-top:12px;"></div>
+            <div id="restore-details" class="recovery-details"></div>
+            <div id="restore-attention" hidden>
+                <p class="info">Inspect affected apps, retained original data and pending restarts before retrying this snapshot. Reconcile source or published-port conflicts, or use a fresh destination. Provider-scoped approvals require manual reauthorization.</p>
+                <p class="info">Acknowledging only clears the notice. It does not start apps or delete retained original data.</p>
+                <button class="btn-secondary" id="btn-acknowledge" onclick="acknowledgeRestore()">Acknowledge after inspection</button>
+            </div>
+            <div id="manage-msg" role="status"></div>
         </section>
 
         <!-- Restic config -->
         <section>
             <h2>Restic configuration</h2>
-            <label>Repository password</label>
+            <label for="conf-repo-password">Repository password</label>
             <p class="info">
                 The password used to encrypt the backup.
                 You will need this password to restore from your backups, so make sure to keep it safe.
@@ -270,7 +290,7 @@
                 <input type="{{ 'password' if config.repo_password else 'text' }}" id="conf-repo-password" value="{{ config.repo_password or '' }}" autocomplete="off" style="margin-bottom:0;">
                 <button class="btn-secondary" onclick="generatePassword()" style="white-space:nowrap;">Generate</button>
             </div>
-            <label>Backup interval (seconds, 0 = disabled, minimum 60 when enabled)</label>
+            <label for="conf-interval">Backup interval (seconds, 0 = disabled, minimum 60 when enabled)</label>
             <input type="number" id="conf-interval" value="{{ config.interval_seconds }}" min="0">
 
             <h3>Retention policy</h3>
@@ -285,27 +305,27 @@
             </p>
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 12px;margin-bottom:12px;">
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the N most recent snapshots">Keep last</label>
+                    <label for="conf-keep-last" style="font-size:0.85rem;" title="Keep the N most recent snapshots">Keep last</label>
                     <input type="number" id="conf-keep-last" value="{{ config.keep_last }}" min="0" style="margin-bottom:0;">
                 </div>
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N hours that have one">Keep hourly</label>
+                    <label for="conf-keep-hourly" style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N hours that have one">Keep hourly</label>
                     <input type="number" id="conf-keep-hourly" value="{{ config.keep_hourly }}" min="0" style="margin-bottom:0;">
                 </div>
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N days that have one">Keep daily</label>
+                    <label for="conf-keep-daily" style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N days that have one">Keep daily</label>
                     <input type="number" id="conf-keep-daily" value="{{ config.keep_daily }}" min="0" style="margin-bottom:0;">
                 </div>
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N weeks that have one">Keep weekly</label>
+                    <label for="conf-keep-weekly" style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N weeks that have one">Keep weekly</label>
                     <input type="number" id="conf-keep-weekly" value="{{ config.keep_weekly }}" min="0" style="margin-bottom:0;">
                 </div>
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N months that have one">Keep monthly</label>
+                    <label for="conf-keep-monthly" style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N months that have one">Keep monthly</label>
                     <input type="number" id="conf-keep-monthly" value="{{ config.keep_monthly }}" min="0" style="margin-bottom:0;">
                 </div>
                 <div>
-                    <label style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N years that have one">Keep yearly</label>
+                    <label for="conf-keep-yearly" style="font-size:0.85rem;" title="Keep the newest snapshot for each of the last N years that have one">Keep yearly</label>
                     <input type="number" id="conf-keep-yearly" value="{{ config.keep_yearly }}" min="0" style="margin-bottom:0;">
                 </div>
             </div>
@@ -325,9 +345,9 @@
             <p class="info">
                 Changing the URL does not migrate existing data.
             </p>
-            <label>Backend URL</label>
+            <label for="conf-repo">Backend URL</label>
             <input type="text" id="conf-repo" value="{{ config.repo }}">
-            <label>Environment variables (<code>KEY=value;KEY2=value2</code>)</label>
+            <label for="conf-env">Environment variables (<code>KEY=value;KEY2=value2</code>)</label>
             <input type="{{ 'password' if env_string else 'text' }}" id="conf-env" value="{{ env_string }}" placeholder="AWS_ACCESS_KEY_ID=...;AWS_SECRET_ACCESS_KEY=..." autocomplete="off">
 
             <div class="btn-row">
@@ -339,26 +359,20 @@
             <div id="test-result"></div>
         </section>
 
-    </div>
-
-    <!-- ============================================================
-         PAGE: Migrate
-         ============================================================ -->
-    <div id="page-migrate" class="page">
-
         <!-- Router API Token -->
         <section id="router-token-section" style="{% if not config.get('router_api_token') %}background:#fef3c7;border-color:#f59e0b;{% endif %}">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                 <h2 style="margin:0;{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">Router API Token</h2>
                 <span id="router-token-badge" class="status-badge {% if config.get('router_api_token') %}status-success{% else %}status-warning{% endif %}">
-                    {% if config.get('router_api_token') %}Configured{% else %}Required{% endif %}
+                    {% if config.get('router_api_token') %}Configured{% else %}Limited scope{% endif %}
                 </span>
             </div>
             <p class="info" id="router-token-desc" style="{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">
-                The backup app needs an API token from the local Cloud in a Bottle instance to manage and transfer app data in this instance. 
-                Generate one in the dashboard settings page under <strong>API Tokens</strong>.
+                Optional for basic definition and API-key backups. Configure a local owner token to also capture desired app states, exact global service grants and provider selections. Full configuration restore and migration require owner authority.
+                Generate a token in dashboard settings under <strong>API Tokens</strong>. An invalid configured token fails the backup.
             </p>
-            <label>Router API Token</label>
+            <p class="info">Every new backup requires the owner-approved global <strong>Private</strong> grant for <code>github.com/cloud-in-a-bottle/cloud-in-a-bottle/services/app-definitions</code>. On older installations, use native <strong>Update &amp; Reload</strong> and approve the request. Missing or failed export fails the backup.</p>
+            <label for="router-token-input">Router API Token</label>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
                 <input type="password" id="router-token-input" placeholder="{% if config.get('router_api_token') %}Configured; enter a new token to update. {% else %}Paste your API token here{% endif %}" autocomplete="off" style="margin-bottom:0;">
                 <button class="btn-secondary" id="btn-toggle-router-token" onclick="toggleRouterTokenVisibility()" type="button" style="white-space:nowrap;">Show</button>
@@ -366,28 +380,30 @@
             <div class="btn-row" style="margin-top:8px;">
                 <button class="btn-primary" id="btn-save-router-token" onclick="saveRouterToken()">Save token</button>
                 <button class="btn-secondary" id="btn-test-router-token" onclick="testRouterToken()">Test connection</button>
-                <button class="btn-secondary" id="btn-clear-router-token" onclick="clearRouterToken()" style="color:#dc2626;{% if not config.get('router_api_token') %}display:none;{% endif %}">Clear</button>
+                <button class="btn-secondary" id="btn-clear-router-token" onclick="clearRouterToken()" style="color:#991b1b;{% if not config.get('router_api_token') %}display:none;{% endif %}">Clear</button>
             </div>
-            <div id="router-token-msg"></div>
+            <div id="router-token-msg" role="status"></div>
         </section>
+
+    </div>
+
+    <div id="page-migrate" class="page">
 
         <section>
             <h2>Migrate apps to another instance</h2>
             <p class="info">
-                Move apps and data to another Cloud in a Bottle instance. The backup app needs to be installed on both instances. An API token from the destination also needs to be provided. 
-                This transfers all permanent app data and will restart the app on the other side. 
+                Move persistent app data, private definitions, API-key records, global service grants and provider selections to another instance. Upgrade both backup apps to protocol v4 and provide owner API tokens for both instances.
             </p>
+            <button class="btn-secondary" onclick="showTokenSetup()">Set up local Router API Token</button>
             <details style="margin-bottom:12px;">
                 <summary style="cursor:pointer;font-size:0.85rem;color:#92400e;font-weight:600;">Details about migration</summary>
                 <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
-                    <strong>This instance:</strong> The selected apps are stopped before the
-                    transfer and are left stopped afterward, so nothing writes to their data
-                    while it is copied. No data on this instance is modified or deleted.
+                    <strong>This instance:</strong> The backend validates the target and captures configuration and desired states before pausing all non-backup apps that may write shared data, including unselected apps. Selected apps remain stopped after cutover; previously running unselected apps resume during cleanup. Source app data is not modified or deleted.
                     <br><br>
-                    <strong>Destination:</strong> Running apps will be stopped during the migration, and existing app data for migrated apps will be deleted.
+                    <strong>Destination:</strong> All bounded chunks are staged and checksummed before apps are stopped and selected data trees are replaced. Keys are imported additively and providers/grants are restored before consumers. Recovery waits for readiness.
                     Other apps retain data and are restarted afterward.
                     <br><br>
-                    <strong>Not migrated:</strong> API tokens, owner password, and settings are not transferred. 
+                    <strong>Limits:</strong> Owner password, sessions and platform settings are not transferred. Provider-scoped OAuth approvals require manual reauthorization and make recovery incomplete. Existing app sources and published ports must match. Both existing and newly installed apps start during recovery before saved stopped states are applied; they can run while other apps become ready.
                     {% for entry in scope.excluded if entry.user_facing and entry.reason %}
                     The path <code>{{ entry.path }}</code> is also excluded from
                     the snapshot pipeline. {{ entry.reason }}
@@ -410,15 +426,15 @@
             </div>
 
             <div style="margin-bottom:12px;">
-                <label>Destination instance URL</label>
+                <label for="push-target-url">Destination instance URL</label>
                 <input type="text" id="push-target-url" placeholder="https://my-other-instance.selfhost.imbue.com">
             </div>
             <div style="margin-bottom:12px;">
-                <label>Destination API token</label>
+                <label for="push-target-token">Destination API token</label>
                 <input type="password" id="push-target-token" placeholder="Paste the token you generated on the destination instance">
             </div>
             <div class="btn-row" style="margin-bottom:12px;">
-                <button class="btn-primary" id="btn-migrate" onclick="stopAppsAndMigrate()">Stop apps and migrate</button>
+                <button class="btn-primary" id="btn-migrate" onclick="startMigration()" disabled>Validate and migrate</button>
             </div>
 
             <!-- Progress -->
@@ -433,12 +449,18 @@
                 <div id="mig-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#555;white-space:pre-wrap;"></div>
             </div>
 
-            <div id="mig-msg"></div>
+            <div id="mig-details" class="recovery-details"></div>
+            <div id="mig-state" role="status"></div>
+            <div id="mig-msg" role="status"></div>
         </section>
 
     </div>
+    </main>
 
     <script>
+        // This app's own (configurable) name: it must never be a migration
+        // target or a stop candidate for itself.
+        const APP_NAME = {{ app_name | tojson }};
         const BASE = "{{ base_path }}";
         // Excluded entries are sourced from the same _backup_scope_summary
         // helper that renders the Status panel, so the in-browser note
@@ -478,11 +500,13 @@
             const clearBtn = document.getElementById("btn-clear-router-token");
             if (badge) {
                 badge.className = "status-badge " + (configured ? "status-success" : "status-warning");
-                badge.textContent = configured ? "Configured" : "Required";
+                badge.textContent = configured ? "Configured" : "Limited scope";
             }
             if (input) {
                 input.value = "";
-                input.placeholder = configured ? "(Configured — enter new token to update)" : "Paste your router API token here";
+                input.placeholder = configured ? "Configured; enter new token to update" : "Paste your router API token here";
+                input.type = "password";
+                document.getElementById("btn-toggle-router-token").textContent = "Show";
             }
             if (section) {
                 section.style.background = configured ? "white" : "#fef3c7";
@@ -509,6 +533,7 @@
             });
             if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = "Save token"; }
             if (res.ok) {
+                rememberOwnerToken(token);
                 setRouterTokenUIState(true);
                 showMsg("router-token-msg", "Router API token saved successfully!", true);
                 refreshAppsStatus();
@@ -528,6 +553,7 @@
             });
             if (testBtn) { testBtn.disabled = false; testBtn.textContent = "Test connection"; }
             if (res.ok) {
+                rememberOwnerToken(typedToken);
                 showMsg("router-token-msg", res.message || "Connected to router successfully!", true);
                 if (!typedToken) setRouterTokenUIState(true);
             } else {
@@ -556,9 +582,35 @@
 
         let cachedAppsList = [];
         let selectedAppNames = null; // null = all apps selected by default
-        // Held across the stop -> chown -> push sequence. The intermediate
-        // refreshAppsStatus() would otherwise re-enable the button mid-run.
+        // Reserve the UI while the backend accepts and runs its migration job.
         let migBusy = false;
+        let appsLoaded = false;
+        let restoreBusy = false;
+        let restoreSubmitting = false;
+        let acknowledgeBusy = false;
+        let acknowledgeMigrationBusy = false;
+        // Owner authority for privileged actions. Held in memory for this page
+        // only: the app never persists a browser-supplied token, and a
+        // co-located container cannot supply one.
+        let ownerAuthToken = '';
+
+        function ownerAuthHeaders() {
+            return ownerAuthToken ? { Authorization: 'Bearer ' + ownerAuthToken } : {};
+        }
+
+        function rememberOwnerToken(token) {
+            const trimmed = typeof token === 'string' ? token.trim() : '';
+            if (trimmed) ownerAuthToken = trimmed;
+            return ownerAuthToken;
+        }
+
+        const OWNER_REQUIRED = 'Owner authorization required: send a valid owner Router API token as a Bearer token.';
+        function ownerAuthMessage(res) {
+            return res && res.httpStatus === 401
+                ? 'Owner authorization required. Paste your owner Router API token in the owner authorization section above, save it, then retry. Nothing was changed.'
+                : (res && res.error) || 'The request was not accepted.';
+        }
+        let lastRestoreStatus = null;
 
         function getSelectedApps() {
             if (selectedAppNames === null) return null;
@@ -590,10 +642,10 @@
 
         function updateMigAppsButtons() {
             const btn = document.getElementById("btn-migrate");
-            if (!btn || migBusy || migPolling) return;
+            if (!btn) return;
             const cbs = Array.from(document.querySelectorAll(".mig-app-cb"));
             const checkedCount = cbs.filter(cb => cb.checked).length;
-            btn.disabled = checkedCount === 0 && cachedAppsList.length > 0;
+            btn.disabled = migBusy || migrationRunning || lockWasBusy || !appsLoaded || checkedCount === 0;
         }
 
         async function refreshAppsStatus() {
@@ -601,17 +653,19 @@
             const listEl = document.getElementById("mig-apps-list");
             if (!listEl) return;
             if (!res.ok) {
+                appsLoaded = false;
                 const isTokenErr = res.error && (res.error.includes("token") || res.error.includes("401") || res.error.includes("403"));
                 if (isTokenErr) {
-                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;font-weight:500;">Router token invalid or not configured. Set a valid token above.</span>';
+                    listEl.textContent = 'Router token invalid or not configured. Use Set up local Router API Token.';
                 } else {
-                    listEl.innerHTML = '<span style="color:#dc2626;font-size:0.85rem;">Could not load app status: ' + (res.error || "unknown") + '</span>';
+                    listEl.textContent = 'Could not load app status. Check the local router connection.';
                 }
                 updateMigAppsButtons();
                 return;
             }
             const apps = res.apps || {};
-            const names = Object.keys(apps).filter(n => n !== "backup");
+            appsLoaded = true;
+            const names = Object.keys(apps).filter(n => n !== APP_NAME);
             cachedAppsList = names.map(n => ({ name: n, status: apps[n].status || "unknown" }));
 
             if (names.length === 0) {
@@ -626,9 +680,9 @@
                 const badgeClass = s === "running" ? "status-success" : s === "stopped" ? "status-none" : "status-warning";
                 return `
                     <label style="display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px solid #e5e7eb;border-radius:6px;background:white;cursor:pointer;user-select:none;">
-                        <input type="checkbox" class="mig-app-cb" value="${app.name}" ${isChecked ? "checked" : ""} onchange="onMigAppCheckboxChange()" style="margin:0;cursor:pointer;">
-                        <span style="font-size:0.85rem;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${app.name}</span>
-                        <span class="status-badge ${badgeClass}" style="margin-left:auto;font-size:0.72rem;padding:2px 6px;">${s}</span>
+                        <input type="checkbox" class="mig-app-cb" value="${escapeHtml(app.name)}" ${isChecked ? "checked" : ""} onchange="onMigAppCheckboxChange()" style="margin:0;cursor:pointer;">
+                        <span style="font-size:0.85rem;font-weight:600;color:#333;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(app.name)}</span>
+                        <span class="status-badge ${badgeClass}" style="margin-left:auto;font-size:0.72rem;padding:2px 6px;">${escapeHtml(s)}</span>
                     </label>
                 `;
             }).join("");
@@ -642,25 +696,23 @@
 
         function showPage(name) {
             document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => { b.classList.remove('active'); b.removeAttribute('aria-current'); });
             document.getElementById('page-' + name).classList.add('active');
             document.querySelectorAll('.tab-btn').forEach(b => {
                 if ((name === 'backup' && b.textContent === 'Backups') ||
                     (name === 'migrate' && b.textContent === 'Migrate')) {
                     b.classList.add('active');
+                    b.setAttribute('aria-current', 'page');
                 }
             });
             location.hash = name;
             if (name === 'migrate') refreshAppsStatus();
         }
 
-        (function() {
-            const hash = location.hash.replace('#', '');
-            if (hash === 'migrate') {
-                showPage('migrate');
-                refreshAppsStatus();
-            }
-        })();
+        function showTokenSetup() {
+            showPage('backup');
+            document.getElementById('router-token-input').focus();
+        }
 
         /* ================================================================
            Shared helpers
@@ -672,18 +724,26 @@
                 opts.headers = { "Content-Type": "application/json", ...(opts.headers || {}) };
                 opts.body = JSON.stringify(opts.body);
             }
-            const r = await fetch(url, opts);
-            const ct = r.headers.get("content-type") || "";
-            if (!ct.includes("application/json")) {
-                return { ok: false, error: "Server error (HTTP " + r.status + ")" };
+            try {
+                const r = await fetch(url, { ...opts, signal: AbortSignal.timeout(30000) });
+                const ct = r.headers.get("content-type") || "";
+                // httpStatus never collides with response bodies that already
+                // carry their own "status" object, such as /api/migration/status.
+                if (!ct.includes("application/json")) {
+                    return { ok: false, httpStatus: r.status, error: "Server error (HTTP " + r.status + ")" };
+                }
+                const result = await r.json();
+                return { ...result, httpStatus: r.status, ...(r.ok ? {} : { ok: false }) };
+            } catch (_) {
+                // A lost response may still have started a job. Status polls reconcile it.
+                return { ok: false, unavailable: true, error: "Connection unavailable. Check operation status before retrying." };
             }
-            return r.json();
         }
 
         function showMsg(id, text, ok) {
             const el = document.getElementById(id);
             el.textContent = text;
-            el.className = "msg " + (ok ? "msg-ok" : "msg-err");
+            el.className = "msg " + (ok === null ? "msg-pending" : ok ? "msg-ok" : "msg-err");
             setTimeout(() => { el.textContent = ""; el.className = ""; }, 6000);
         }
 
@@ -718,7 +778,7 @@
         function escapeHtml(str) {
             const d = document.createElement("div");
             d.textContent = str == null ? "" : String(str);
-            return d.innerHTML.replace(/'/g, "&#39;");
+            return d.innerHTML.replace(/'/g, "&#39;").replace(/"/g, "&quot;");
         }
 
         /* ================================================================
@@ -894,6 +954,15 @@
 
             const poll = async () => {
                 const res = await api("/api/status");
+                // A lost status response is not an idle system: keep the last
+                // known operation state on screen and keep polling.
+                if (typeof res.running !== "boolean") {
+                    stateEl.innerHTML = '<span class="status-badge status-error">status unavailable</span>';
+                    btn.disabled = true;
+                    setTimeout(poll, 2000);
+                    return;
+                }
+                applyLockStatus(res);
                 if (res.running) {
                     stateEl.innerHTML = '<span class="status-badge status-running">running</span>';
                     setTimeout(poll, 2000);
@@ -978,7 +1047,7 @@
 
             if (!res.ok || !res.repo_ok) {
                 container.style.display = "block";
-                body.innerHTML = '<tr><td colspan="5" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
+                body.innerHTML = '<tr><td colspan="6" style="padding:6px 8px;color:#991b1b;">Could not read restic repo. Check the repository URL and password.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 snapshotsAll = [];
                 return;
@@ -988,7 +1057,7 @@
 
             if (snapshotsAll.length === 0) {
                 container.style.display = "block";
-                body.innerHTML = '<tr><td colspan="5" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
+                body.innerHTML = '<tr><td colspan="6" style="padding:6px 8px;color:#666;">No snapshots yet.</td></tr>';
                 if (btn) { btn.disabled = false; btn.textContent = "Refresh snapshots"; }
                 return;
             }
@@ -1039,9 +1108,10 @@
                     : (name ? escapeHtml(name) : '<span style="color:#aaa;">-</span>');
                 tr.innerHTML =
                     '<td style="padding:6px 8px;">' + escapeHtml(formatDateTime(s.time)) + '</td>' +
-                    '<td style="padding:6px 8px;font-family:monospace;">' + escapeHtml(s.short_id) + '</td>' +
+                    '<td style="padding:6px 8px;font-family:monospace;"><button class="browse-link" aria-label="Select snapshot ' + escapeHtml(s.short_id) + '">' + escapeHtml(s.short_id) + '</button></td>' +
                     '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
                     '<td style="padding:6px 8px;overflow-wrap:anywhere;">' + escapeHtml(source) + '</td>' +
+                    '<td style="padding:6px 8px;"><span class="status-badge ' + (s.has_configuration && s.has_runtime ? 'status-success' : 'status-warning') + '">' + snapshotScope(s).label + '</span></td>' +
                     '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>';
                 body.appendChild(tr);
             });
@@ -1096,6 +1166,8 @@
             document.getElementById("selected-snapshot-label").textContent = shortId + "  (" + id.substring(0, 16) + "…)";
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
+            document.getElementById("selected-snapshot-scope").textContent = snapshotScope(snapshotsAll.find(s => s.id === id)).description;
+            updateRestoreButtons();
             const rows = document.getElementById("snapshots-body").querySelectorAll("tr");
             rows.forEach(tr => {
                 tr.style.background = "";
@@ -1116,7 +1188,7 @@
         // snapshots). Using textContent + data-* + delegated listeners is
         // safe because the DOM never interprets the value as code.
         function makeBrowseLink(label, root, path) {
-            const span = document.createElement("span");
+            const span = document.createElement("button");
             span.className = "browse-link";
             span.textContent = label;
             span.dataset.root = root || "";
@@ -1260,46 +1332,237 @@
             renderFileBrowser(res, root || null, subpath || "");
         }
 
-        async function triggerRestore() {
-            if (!selectedSnapshotId) return;
-            if (!confirm("This will overwrite files across all captured data roots with the selected snapshot. Continue?")) return;
+        function snapshotScope(snapshot) {
+            if (!snapshot || snapshot.has_configuration !== true) return {
+                label: 'Legacy: files only',
+                description: 'File-only recovery. Cannot recreate missing app definitions or API keys; running apps are not coordinated. Reload apps manually as needed.'
+            };
+            return snapshot.has_runtime === true ? {
+                label: 'Configuration + runtime',
+                description: 'App data, definitions, API-key records, desired states, global grants and provider selections. Owner authority required. Provider-scoped approvals need manual reauthorization.'
+            } : {
+                label: 'Configuration: limited runtime',
+                description: 'App data, definitions and API-key records. Desired states, global grants and provider selections were not captured. Owner authority required; configure permissions and states manually.'
+            };
+        }
 
-            const btn = document.getElementById("btn-restore");
-            btn.disabled = true;
-            btn.textContent = "Restoring...";
-            const res = await api("/api/restore", { method: "POST", body: { snapshot: selectedSnapshotId } });
-            if (res.ok) {
-                showMsg("manage-msg", "Restore started", true);
-                pollRestore();
-            } else {
-                showMsg("manage-msg", res.error || "Failed", false);
-                btn.disabled = false;
-                btn.textContent = "Restore";
+        // Deliberately project known public fields. Never stringify bundles, grants,
+        // token names/verifiers, arbitrary errors or additional response properties.
+        const publicText = value => typeof value === 'string' ? value : '';
+        const publicCount = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : '?';
+        function recoveryDetails(container, progress) {
+            container.replaceChildren();
+            if (!progress || typeof progress !== 'object') return;
+            const line = text => {
+                const p = document.createElement('p');
+                p.textContent = text;
+                container.appendChild(p);
+            };
+            if (publicText(progress.phase)) line('Phase: ' + progress.phase);
+            if (publicText(progress.snapshot)) line('Snapshot: ' + progress.snapshot);
+            if (publicText(progress.session_id)) line('Receive session: ' + progress.session_id);
+            if (Array.isArray(progress.retained_sessions)) progress.retained_sessions.filter(v => typeof v === 'string').forEach(id => {
+                line('Retained migration data session: ' + id + '. Inspect original data before removing staging.');
+            });
+            // An outgoing record keeps different retained data, so its notice
+            // wording must not promise recovery state that does not exist.
+            const notice = progress.kind === 'outgoing' ? {
+                attention: 'Outgoing migration from this instance requires owner inspection. Backups and new migrations stay blocked.',
+                acknowledged: 'Outgoing migration notice acknowledged. This does not confirm the destination and does not start apps.',
+            } : {
+                attention: 'Incoming recovery requires owner inspection before retrying. Retained data has not been removed.',
+                acknowledged: 'Incoming recovery notice acknowledged. This does not confirm recovery or remove retained data.',
+            };
+            if (progress.needs_attention === true) line(notice.attention);
+            if (progress.acknowledged === true) line(notice.acknowledged);
+            if (progress.phase === 'files_only') line('Files only: definitions, API keys and app states were not restored. Stale files may remain; reload apps manually as needed.');
+            for (const [key, label] of [['affected_apps', 'Affected apps'], ['affected_roots', 'Affected roots']]) {
+                if (Array.isArray(progress[key])) line(label + ': ' + progress[key].map(publicText).filter(Boolean).join(', '));
+            }
+            if (Array.isArray(progress.retained_stages)) progress.retained_stages.forEach(stage => {
+                if (stage && publicText(stage.root)) line('Retained original data: ' + stage.root + ' (job ' + publicText(stage.job_id) + ')');
+            });
+            if (Array.isArray(progress.pending_restarts)) progress.pending_restarts.forEach(app => {
+                const name = typeof app === 'string' ? publicText(app) : publicText(app && app.name);
+                if (name) line('Pending restart: ' + name);
+            });
+            const recovery = progress.recovery;
+            if (!recovery || typeof recovery !== 'object') return;
+            if (publicText(recovery.current_app)) line('Current app: ' + recovery.current_app);
+            if (recovery.tokens) {
+                const t = recovery.tokens;
+                line('API keys: ' + publicCount(t.expected) + ' expected, ' + publicCount(t.added) + ' added, ' + publicCount(t.existing) + ' already present. Import ' + (t.confirmed === true ? 'confirmed.' : 'not confirmed.'));
+            }
+            if (recovery.providers) line('Default providers: ' + publicCount(recovery.providers.restored_defaults) + ' of ' + publicCount(recovery.providers.expected_defaults) + ' restored.');
+            if (Array.isArray(recovery.paused_apps)) recovery.paused_apps.forEach(app => {
+                if (!app || !publicText(app.name) || app.selected === true) return;
+                line('Paused app: ' + app.name + ' / previous state: ' + publicText(app.previous_status) +
+                    ' / stop: ' + publicText(app.stop) + ' / restart: ' + publicText(app.restart));
+            });
+            if (recovery.runtime_captured === false) line('Limited recovery: desired states, global service grants and provider selections were not captured. Configure these manually.');
+            else if (recovery.runtime_complete === false) line('Runtime recovery is incomplete. Inspect permissions, provider approvals and desired states.');
+            const warnings = value => {
+                if (Array.isArray(value)) value.filter(v => typeof v === 'string').forEach(warning => line('Warning: ' + warning));
+            };
+            warnings(recovery.warnings);
+            if (Array.isArray(recovery.apps_before)) {
+                const before = document.createElement('ul');
+                recovery.apps_before.forEach(app => {
+                    if (!app || !publicText(app.name)) return;
+                    const item = document.createElement('li');
+                    item.textContent = app.name + (publicText(app.status) ? ' / previous state: ' + publicText(app.status) : '');
+                    before.appendChild(item);
+                });
+                if (before.childNodes.length) {
+                    line('Destination apps before this migration:');
+                    container.appendChild(before);
+                }
+            }
+            if (Array.isArray(recovery.apps)) {
+                const list = document.createElement('ul');
+                recovery.apps.forEach(app => {
+                    if (!app || !publicText(app.name)) return;
+                    const item = document.createElement('li');
+                    item.textContent = app.name + ': ' + (app.ok === true ? 'confirmed' : 'not confirmed') +
+                        [app.plan_status, app.status, app.outcome].map(publicText).filter(Boolean).map(s => ' / ' + s).join('');
+                    list.appendChild(item);
+                    if (Array.isArray(app.warnings)) app.warnings.filter(v => typeof v === 'string').forEach(w => {
+                        const note = document.createElement('li');
+                        note.textContent = app.name + ' warning: ' + w;
+                        list.appendChild(note);
+                    });
+                });
+                container.appendChild(list);
             }
         }
 
-        async function pollRestore() {
-            const btn = document.getElementById("btn-restore");
-            const stateEl = document.getElementById("restore-state");
+        function updateRestoreButtons() {
+            const btn = document.getElementById('btn-restore');
+            btn.disabled = restoreBusy || restoreSubmitting || acknowledgeBusy || lockWasBusy || !selectedSnapshotId;
+            btn.textContent = restoreBusy || restoreSubmitting ? 'Restoring...' : 'Restore';
+            document.getElementById('btn-acknowledge').disabled = acknowledgeBusy || restoreBusy || restoreSubmitting || lockWasBusy;
+        }
 
-            const poll = async () => {
-                const res = await api("/api/restore/status");
-                if (res.running) {
-                    stateEl.innerHTML = '<span class="status-badge status-restore">restoring...</span>';
-                    setTimeout(poll, 2000);
-                } else {
-                    if (res.last_status === "success") {
-                        stateEl.innerHTML = '<span class="status-badge status-success">restored: ' + escapeHtml(res.last_restore || "") + '</span>';
-                    } else if (res.last_status) {
-                        stateEl.innerHTML = '<span class="status-badge status-error">' + escapeHtml(res.last_status) + '</span>';
-                    } else {
-                        stateEl.innerHTML = "";
-                    }
-                    btn.disabled = false;
-                    btn.textContent = "Restore";
-                }
-            };
-            poll();
+        let restoreEpoch = 0;
+        let restorePollSequence = 0;
+        async function triggerRestore() {
+            if (!selectedSnapshotId || restoreBusy || restoreSubmitting || acknowledgeBusy || lockWasBusy) return;
+            const snapshot = snapshotsAll.find(s => s.id === selectedSnapshotId);
+            const scope = snapshotScope(snapshot);
+            const effects = snapshot?.has_configuration === true ?
+                'This replaces selected app data across captured roots, removing stale files. Recovery pauses non-backup apps and waits for readiness. Existing and new selected apps run before saved stopped states are applied.' :
+                'This overwrites captured files in place. Files absent from the snapshot, including stale database WAL files, remain. Running apps are not stopped.';
+            if (!confirm(scope.description + '\n' + effects + ' Continue?')) return;
+            if (snapshot?.has_configuration === true && !ownerAuthToken) {
+                // Fail before the request: the server refuses configuration
+                // recovery for a caller it cannot confirm as owner, and a job
+                // that stops apps must never start on a guess.
+                showMsg('manage-msg', ownerAuthMessage({ httpStatus: 401 }), false);
+                return;
+            }
+            restoreSubmitting = true;
+            restoreEpoch++;
+            const state = document.getElementById('restore-state');
+            state.textContent = 'Submitting restore. Completion has not been confirmed.';
+            state.className = 'msg msg-pending';
+            document.getElementById('restore-details').replaceChildren();
+            document.getElementById('restore-attention').hidden = true;
+            updateRestoreButtons();
+            const res = await api('/api/restore', {
+                method: 'POST', headers: ownerAuthHeaders(), body: { snapshot: selectedSnapshotId }
+            });
+            restoreEpoch++;
+            restoreSubmitting = false;
+            restoreBusy = res.ok === true || res.unavailable === true;
+            showMsg('manage-msg', res.ok ? 'Restore accepted. Waiting for verified recovery results.' : ownerAuthMessage(res), res.ok ? null : false);
+            updateRestoreButtons();
+            await pollRestore();
+        }
+
+        async function pollRestore() {
+            if (restoreSubmitting || acknowledgeBusy) return;
+            const epoch = restoreEpoch;
+            const sequence = ++restorePollSequence;
+            const res = await api('/api/restore/status');
+            if (epoch !== restoreEpoch || sequence !== restorePollSequence || restoreSubmitting || acknowledgeBusy) return;
+            const el = document.getElementById('restore-state');
+            if (typeof res.running !== 'boolean') {
+                el.textContent = 'Restore status unavailable. Completion has not been confirmed.';
+                el.className = 'msg msg-err';
+                document.getElementById('restore-attention').hidden = true;
+                return;
+            }
+            lastRestoreStatus = res;
+            restoreBusy = res.running;
+            const p = res.progress || {};
+            const recovery = p.recovery;
+            const complete = !res.running && !res.needs_attention && res.last_status === 'success' && (!recovery || recovery.ok === true);
+            const limited = complete && recovery && recovery.runtime_captured === false;
+            el.textContent = res.running ? 'Restore running. Completion is not yet confirmed.' :
+                p.phase === 'acknowledged' ? 'Recovery notice acknowledged. This does not confirm recovery.' :
+                complete ? (limited ? 'Captured configuration restored with limited runtime scope.' : p.phase === 'files_only' ? 'File-only restore complete. App configuration was not restored.' : 'Restore complete: captured recovery scope verified.') :
+                res.needs_attention || res.last_status ? 'Recovery incomplete or failed. Inspect results before retrying.' : '';
+            el.className = el.textContent ? 'msg ' + (res.running || p.phase === 'acknowledged' ? 'msg-pending' : limited ? 'msg-warning' : complete ? 'msg-ok' : 'msg-err') : '';
+            recoveryDetails(document.getElementById('restore-details'), p);
+            if (!complete && !res.running && res.last_status) {
+                // Exact safe backend messages only; legacy restic stderr can contain private URLs.
+                const safeFailures = [
+                    'Configure a destination Router API Token before restoring apps and API keys.',
+                    'Router owner authentication failed. Check the configured owner API token.',
+                    'An existing selected app has a different source or published-port configuration. Resolve the conflicting app configuration before restoring.',
+                    'The snapshot metadata is missing, ambiguous, or unsupported.',
+                    'Could not read private configuration from this snapshot.',
+                    'Could not read the selected snapshot.',
+                    'This snapshot contains unsupported data roots.',
+                    'Invalid private configuration bundle.',
+                    'Expected a valid schema-v2 Private app definition document.',
+                    'The router could not be reached or the request timed out.',
+                    'Destination apps are building, starting, or being removed. Wait before restoring.',
+                    'Retry a snapshot covering the interrupted apps, or inspect and acknowledge the previous recovery.',
+                    'restic repo not configured',
+                ];
+                const reason = safeFailures.find(message => res.last_status === 'error: ' + message);
+                const note = document.createElement('p');
+                note.textContent = reason || 'Check the repository connection, owner Router API Token, snapshot compatibility and app state before retrying.';
+                document.getElementById('restore-details').appendChild(note);
+            }
+            document.getElementById('restore-attention').hidden = !(res.needs_attention === true && !res.running);
+            updateRestoreButtons();
+        }
+
+        async function acknowledgeRestore() {
+            if (acknowledgeBusy || restoreBusy || restoreSubmitting || lockWasBusy || !lastRestoreStatus?.needs_attention) return;
+            acknowledgeBusy = true;
+            restoreEpoch++;
+            updateRestoreButtons();
+            const res = await api('/api/restore/acknowledge', { method: 'POST', headers: ownerAuthHeaders(), body: {} });
+            restoreEpoch++;
+            acknowledgeBusy = false;
+            if (!res.ok) showMsg('manage-msg', res.error === OWNER_REQUIRED ? ownerAuthMessage(res) : 'Notice could not be acknowledged. Inspect storage and retry.', false);
+            await pollRestore();
+            updateRestoreButtons();
+        }
+
+        async function acknowledgeMigration() {
+            if (acknowledgeMigrationBusy || migBusy || lockWasBusy) return;
+            acknowledgeMigrationBusy = true;
+            const res = await api('/api/migration/acknowledge', { method: 'POST', headers: ownerAuthHeaders(), body: {} });
+            acknowledgeMigrationBusy = false;
+            if (!res.ok) {
+                showMsg('manage-msg', res.error === OWNER_REQUIRED ? ownerAuthMessage(res) : 'The incoming migration notice could not be acknowledged. Inspect storage and retry.', false);
+            }
+            await pollMigration();
+        }
+
+        async function acknowledgeSourceMigration() {
+            if (acknowledgeMigrationBusy || migBusy || lockWasBusy) return;
+            acknowledgeMigrationBusy = true;
+            const res = await api('/api/migration/source-acknowledge', { method: 'POST', headers: ownerAuthHeaders(), body: {} });
+            acknowledgeMigrationBusy = false;
+            if (!res.ok) {
+                showMsg('mig-msg', res.error === OWNER_REQUIRED ? ownerAuthMessage(res) : 'The outgoing migration notice could not be acknowledged. Inspect app states and retry.', false);
+            }
+            await pollMigration();
         }
 
         async function deleteSnapshot() {
@@ -1328,12 +1591,12 @@
            Migration page
            ================================================================ */
 
-        let migPolling = false;
+        let migrationRunning = false;
+        let migrationEpoch = 0;
+        let migrationPollSequence = 0;
 
-        // Stopping is a hard requirement, not a courtesy: /api/migration/push
-        // rejects a run whose apps are still up, so the button owns the whole
-        // sequence rather than leaving the user to order it correctly.
-        async function stopAppsAndMigrate() {
+        async function startMigration() {
+            if (migBusy || migrationRunning || lockWasBusy || !appsLoaded || cachedAppsList.length === 0) return;
             const targetUrl = document.getElementById("push-target-url").value.trim();
             const targetToken = document.getElementById("push-target-token").value.trim();
             const selected = getSelectedApps();
@@ -1342,33 +1605,29 @@
                 return;
             }
             if (!targetUrl) { showMsg("mig-msg", "Enter the destination instance URL", false); return; }
+            try {
+                const url = new URL(targetUrl);
+                if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+            } catch (_) { showMsg('mig-msg', 'Enter an HTTP(S) destination URL without credentials, query or fragment.', false); return; }
             if (!targetToken) { showMsg("mig-msg", "Enter the destination API token", false); return; }
             const promptTarget = selected ? selected.join(", ") : "all apps and data";
-            if (!confirm("Stop " + promptTarget + " on this instance and migrate to " + targetUrl + "?")) return;
+            if (!confirm("Migrate " + promptTarget + " to " + targetUrl + "? All non-backup source apps that may write shared data are paused, including unselected apps. Selected apps stay stopped after cutover; previously running unselected apps resume during cleanup.")) return;
 
             const btn = document.getElementById("btn-migrate");
-            const body = selected ? { apps: selected } : {};
             migBusy = true;
+            migrationEpoch++;
+            const state = document.getElementById('mig-state');
+            state.textContent = 'Submitting migration. Completion has not been confirmed.';
+            state.className = 'msg msg-pending';
+            document.getElementById('mig-details').replaceChildren();
+            document.getElementById('mig-progress').style.display = 'none';
+            document.getElementById('mig-msg').textContent = '';
             btn.disabled = true;
             try {
-                btn.textContent = "Stopping apps...";
-                const stopRes = await api("/api/stop-all-apps", { method: "POST", body });
-                if (!stopRes.ok) {
-                    showMsg("mig-msg", "Could not stop apps: " + (stopRes.error || "unknown"), false);
-                    return;
-                }
-                await refreshAppsStatus();
-
-                btn.textContent = "Fixing ownership...";
-                const chownRes = await api("/api/chown-app-data", { method: "POST", body });
-                if (!chownRes.ok) {
-                    showMsg("mig-msg", "Could not fix file ownership: " + (chownRes.error || "unknown"), false);
-                    return;
-                }
-
-                btn.textContent = "Migrating...";
+                btn.textContent = "Validating migration...";
                 const res = await api("/api/migration/push", {
                     method: "POST",
+                    headers: ownerAuthHeaders(),
                     body: {
                         target_url: targetUrl,
                         target_token: targetToken,
@@ -1376,65 +1635,144 @@
                     }
                 });
                 if (!res.ok) {
-                    showMsg("mig-msg", res.error || "Failed", false);
+                    showMsg("mig-msg", res.error === OWNER_REQUIRED ? ownerAuthMessage(res) : (res.error || "Failed"), false);
+                    migrationRunning = res.unavailable === true;
                     return;
                 }
-                showMsg("mig-msg", "Migration started", true);
-                pollMigration();
+                document.getElementById('push-target-token').value = '';
+                migrationRunning = true;
+                showMsg("mig-msg", "Migration accepted. Waiting for verified destination recovery and source cleanup.", null);
             } finally {
+                migrationEpoch++;
                 migBusy = false;
-                // pollMigration owns the button for the duration of the run.
-                if (!migPolling) {
-                    btn.disabled = false;
-                    btn.textContent = "Stop apps and migrate";
-                }
+                await pollMigration();
+                updateMigAppsButtons();
             }
         }
 
-        function pollMigration() {
-            if (migPolling) return;
-            migPolling = true;
+        async function pollMigration() {
+            if (migBusy) return;
+            const epoch = migrationEpoch;
+            const sequence = ++migrationPollSequence;
+            const res = await api('/api/migration/status');
+            if (epoch !== migrationEpoch || sequence !== migrationPollSequence || migBusy) return;
+            if (typeof res.running !== 'boolean') {
+                const state = document.getElementById('mig-state');
+                state.textContent = 'Migration status unavailable. Completion has not been confirmed.';
+                state.className = 'msg msg-err';
+                return;
+            }
+            migrationRunning = res.running;
+            const status = res.status || {};
+            const phase = publicText(status.phase);
+            const progress = typeof status.progress === 'number' && Number.isFinite(status.progress) ? Math.min(100, Math.max(0, status.progress)) : 0;
             const progressEl = document.getElementById("mig-progress");
-            progressEl.style.display = "block";
-
-            const poll = async () => {
-                const res = await api("/api/migration/status");
-                const status = res.status || {};
-                const phase = status.phase || "unknown";
-                const progress = status.progress || 0;
-
-                document.getElementById("mig-phase").textContent = phase;
-                document.getElementById("mig-pct").textContent = progress + "%";
-                document.getElementById("mig-bar").style.width = progress + "%";
-
-                const badge = document.getElementById("mig-phase");
-                badge.className = "status-badge " + (
-                    phase === "done" ? "status-success" :
-                    phase === "error" ? "status-error" :
-                    "status-running"
-                );
-
-                if (res.log && res.log.length > 0) {
-                    const logEl = document.getElementById("mig-log");
-                    logEl.textContent = res.log.join("\n");
-                    logEl.scrollTop = logEl.scrollHeight;
+            progressEl.style.display = phase || res.running ? 'block' : 'none';
+            const incoming = res.receive;
+            const incomingIncomplete = incoming && (incoming.phase !== 'complete' || incoming.result?.ok !== true || incoming.needs_attention === true);
+            const complete = !res.running && phase === 'done' && !incomingIncomplete;
+            const badge = document.getElementById('mig-phase');
+            badge.textContent = phase || 'starting';
+            badge.className = 'status-badge ' + (res.running ? 'status-running' : complete ? 'status-success' : 'status-error');
+            document.getElementById('mig-pct').textContent = progress + '%';
+            document.getElementById('mig-bar').style.width = progress + '%';
+            document.getElementById('mig-log').textContent = Array.isArray(res.log) ? res.log.filter(v => typeof v === 'string').join('\n') : '';
+            const details = document.getElementById('mig-details');
+            details.replaceChildren();
+            if (publicText(status.current_app)) {
+                const p = document.createElement('p');
+                p.textContent = 'Current app: ' + status.current_app;
+                details.appendChild(p);
+            }
+            if (status.source_recovery) {
+                const heading = document.createElement('h3');
+                heading.textContent = 'Source cleanup';
+                details.appendChild(heading);
+                const source = document.createElement('div');
+                // Source sessions only pause/restart apps; their activation/import
+                // fields are intentionally unconfirmed even after a good cutover.
+                recoveryDetails(source, { recovery: { paused_apps: status.source_recovery.paused_apps } });
+                details.appendChild(source);
+            }
+            if (res.receive) {
+                const heading = document.createElement('h3');
+                heading.textContent = 'Incoming migration on this instance';
+                details.appendChild(heading);
+                const receiver = document.createElement('div');
+                recoveryDetails(receiver, {
+                    phase: incoming.phase, session_id: incoming.session_id,
+                    retained_sessions: incoming.retained_sessions, needs_attention: incoming.needs_attention,
+                    acknowledged: incoming.acknowledged,
+                    recovery: incoming.recovery || incoming.result?.recovery || incoming.result
+                });
+                details.appendChild(receiver);
+                if (incoming.needs_attention === true) {
+                    const notice = document.createElement('p');
+                    notice.className = 'info';
+                    notice.textContent = 'Inspect the apps, retained original data and pending restarts from the interrupted incoming migration. Acknowledging clears the notice only; it does not start apps, confirm recovery or delete retained data.';
+                    details.appendChild(notice);
+                    const button = document.createElement('button');
+                    button.className = 'btn-secondary';
+                    button.id = 'btn-acknowledge-migration';
+                    button.textContent = 'Acknowledge incoming migration';
+                    button.disabled = res.running || acknowledgeMigrationBusy;
+                    button.onclick = acknowledgeMigration;
+                    details.appendChild(button);
                 }
-
-                if (res.running) {
-                    setTimeout(poll, 2000);
-                } else {
-                    migPolling = false;
-                    const migBtn = document.getElementById("btn-migrate");
-                    if (migBtn) { migBtn.disabled = false; migBtn.textContent = "Stop apps and migrate"; }
-
-                    if (phase === "done") {
-                        showMsg("mig-msg", "Migration complete! Your apps and data have been transferred.", true);
-                    } else if (phase === "error") {
-                        showMsg("mig-msg", "Migration failed: " + (status.error || ""), false);
-                    }
+            }
+            if (res.source_recovery) {
+                const source_attention = res.source_recovery;
+                const heading = document.createElement('h3');
+                heading.textContent = 'Outgoing migration from this instance';
+                details.appendChild(heading);
+                const record = document.createElement('div');
+                recoveryDetails(record, {
+                    kind: 'outgoing',
+                    phase: source_attention.phase, session_id: source_attention.session_id,
+                    affected_apps: source_attention.selected_apps, needs_attention: source_attention.needs_attention,
+                    acknowledged: source_attention.acknowledged,
+                    pending_restarts: source_attention.restart_pending,
+                    recovery: { apps_before: source_attention.apps_before }
+                });
+                details.appendChild(record);
+                if (source_attention.needs_attention === true) {
+                    const notice = document.createElement('p');
+                    notice.className = 'info';
+                    notice.textContent = 'The previous outgoing migration from this instance did not finish. Backups and new migrations stay blocked until you inspect the app states above and acknowledge the record. Acknowledging clears the block only; it does not start apps or confirm the destination.';
+                    details.appendChild(notice);
+                    const button = document.createElement('button');
+                    button.className = 'btn-secondary';
+                    button.id = 'btn-acknowledge-source-migration';
+                    button.textContent = 'Acknowledge outgoing migration';
+                    button.disabled = res.running || acknowledgeMigrationBusy;
+                    button.onclick = acknowledgeSourceMigration;
+                    details.appendChild(button);
                 }
-            };
-            poll();
+            }
+            const msg = document.getElementById('mig-state');
+            msg.textContent = res.running ? 'Migration running. Completion is not yet confirmed.' :
+                complete ? 'Migration complete. Recovery and cleanup confirmed. Selected apps on the source remain stopped.' :
+                phase ? 'Migration incomplete or failed. Inspect app state and recovery results before retrying. Provider-scoped approvals may need manual reauthorization.' : '';
+            msg.className = msg.textContent ? 'msg ' + (res.running ? 'msg-pending' : complete ? 'msg-ok' : 'msg-err') : '';
+            if (!res.running && !complete) {
+                const safeErrors = [
+                    'Migration requires protocol v4. Upgrade both backup apps.',
+                    'Destination owner authentication failed.',
+                    'Another operation is active.',
+                    'A selected app conflicts with the destination backup executor. Change the selection or executor name.',
+                    'Migration requires owner inspection and acknowledgment before retrying.',
+                    'Invalid or incomplete migration transfer sequence.',
+                    'App data transfer or archive verification failed.',
+                    'Migration deadline exceeded.',
+                ];
+                if (safeErrors.includes(status.error)) {
+                    const p = document.createElement('p');
+                    p.textContent = status.error;
+                    details.appendChild(p);
+                }
+            }
+            document.getElementById('btn-migrate').textContent = res.running ? 'Migrating...' : 'Validate and migrate';
+            updateMigAppsButtons();
         }
 
         // Localize the server-rendered "Last backup" time (leaves "never" as-is
@@ -1453,7 +1791,9 @@
         function applyLockStatus(status) {
             const el = document.getElementById("lock-banner");
             if (!el) return;
-            const busy = !!(status && status.busy);
+            // Never let an unavailable response hide or invent operation state.
+            if (!status || typeof status.busy !== "boolean") return;
+            const busy = status.busy;
             if (busy) {
                 el.textContent = "⏳ " + (status.busy_message
                     || "An operation is in progress — other operations are paused until it finishes.");
@@ -1464,6 +1804,8 @@
                 if (lockWasBusy) { loadSnapshots(); loadRepoStats(); }
             }
             lockWasBusy = busy;
+            updateRestoreButtons();
+            updateMigAppsButtons();
         }
 
         async function refreshLockStatusNow() {
@@ -1488,6 +1830,13 @@
 
         pollLockBanner();
         connectStatusStream();
+        if (location.hash === '#migrate') showPage('migrate');
+        // Reloading either page must retain active and incomplete recovery notices.
+        async function pollRecoveryStatus() {
+            await Promise.all([pollRestore(), pollMigration()]).catch(error => { console.error('recovery poll failed', error && (error.stack || error.message || String(error))); });
+            setTimeout(pollRecoveryStatus, 2000);
+        }
+        pollRecoveryStatus();
 
         // Auto-load snapshots + repo stats on page load (only if configured).
         {% if config.repo %}

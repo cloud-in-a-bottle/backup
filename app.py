@@ -3,43 +3,54 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from quart import Quart, Response, jsonify, render_template, request
 
 import migration
-from operations import OperationLock, OpKind
+import migration_data
+import restic_process
+import snapshot_configuration
+from configuration import (ConfigurationError, RouterClient, _inventory, capture_configuration,
+                        confirm_owner)
+from operations import OperationLock, OpKind, drain
+from recovery import RecoverySession
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 logger.info("backup app module loaded")
 
 app = Quart(__name__)
-# Allow large request bodies for migration data transfers.
-# Set to 10GB to effectively disable the limit.
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10 GB
+# Protocol v4 uses bounded chunks below the platform's 16 MiB proxy limit.
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Paths & configuration
 # ---------------------------------------------------------------------------
 
-BASE_PATH = os.environ.get("OPENHOST_APP_BASE_PATH", "/backup")
+BASE_PATH = os.environ.get("BOTTLE_APP_BASE_PATH", os.environ.get("OPENHOST_APP_BASE_PATH", "/backup"))
+APP_NAME = os.environ.get("BOTTLE_APP_NAME", os.environ.get("OPENHOST_APP_NAME", "backup"))
+APP_TOKEN = os.environ.get("BOTTLE_APP_TOKEN", os.environ.get("OPENHOST_APP_TOKEN", ""))
 APP_DATA_DIR = Path(os.environ.get("OPENHOST_APP_DATA_DIR", "/data/app_data/backup"))
 ALL_APP_DATA = Path("/data/app_data")
 APP_TEMP_DATA = Path("/data/app_temp_data")
 APP_ARCHIVE = Path("/data/app_archive")
 VM_DATA_DIR = Path("/data/vm_data")
 
-# Candidate roots, captured only when present as directories in this container.
+# Roots captured by default, only when present as directories in this container.
 # Standard ``access_all_app_data = true`` mounts expose app data, not router
-# state or host SSH keys; vm_data is an optional, nonstandard candidate.
+# state or host SSH keys. ``vm_data`` is deliberately not captured: it is a
+# host-side, nonstandard location that this mount does not provide, and it
+# stays restorable only for snapshots an older version did capture.
 # Order is significant only for UI display (``list_snapshot_files`` surfaces
 # these as the top-level entries when ``root`` is unset). Missing roots are
 # skipped silently at backup time.
-BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
+BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA)
 
 # ``access_all_app_data = true`` mounts ``/data/app_archive`` into the
 # container so the backup app can see it for migration / inspection,
@@ -58,7 +69,13 @@ BACKUP_ROOTS = (ALL_APP_DATA, APP_TEMP_DATA, VM_DATA_DIR)
 # to ``/data/app_archive`` not being in BACKUP_ROOTS), so a future
 # refactor that adds it to the roots list won't silently start
 # capturing the archive.
-BACKUP_EXCLUDES = (ALL_APP_DATA / "backup", APP_ARCHIVE)
+RESTORE_WORK_NAME = ".bottle-backup-restore"
+BACKUP_EXCLUDES = (
+    ALL_APP_DATA / APP_NAME,
+    APP_TEMP_DATA / APP_NAME,
+    APP_ARCHIVE,
+    *(root / RESTORE_WORK_NAME for root in BACKUP_ROOTS),
+)
 ROUTER_URL = os.environ.get("OPENHOST_ROUTER_URL", "http://host.docker.internal:8080")
 ZONE_DOMAIN = os.environ.get("OPENHOST_ZONE_DOMAIN", "")
 # Hostname recorded on every snapshot (`restic backup --host`). The container's
@@ -108,7 +125,7 @@ KEEP_FLAGS = {
 
 # Snapshot IDs are hex strings; restic emits 8-char short IDs and 64-char long
 # ones. Accept either (plus anything in between) for validation on API input.
-SNAPSHOT_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+SNAPSHOT_ID_RE = re.compile(r"[a-f0-9]{8,64}\Z")
 
 
 # New snapshots are tagged ``bottle`` plus ``zone:<domain>``. Legacy snapshots
@@ -188,21 +205,37 @@ op_lock = OperationLock()
 # gets a finalize, so the lock would otherwise stay held until an app restart
 # (issue #14). Treat a migration idle this long as abandoned and reclaim it.
 MIGRATION_IDLE_TIMEOUT_SECONDS = 30 * 60
+_migration_receiver: migration.MigrationReceiver | None = None
 
 
-def _reclaim_abandoned_migration() -> None:
+async def _reclaim_abandoned_migration() -> None:
     """Release a migration lock orphaned by a dead/stopped source (issue #14).
 
     Safe to call before starting any operation: it only clears a *migration*
     lock idle past the timeout, so a live transfer (kept fresh via
     ``op_lock.touch()`` on each receive) is never disturbed.
     """
-    op_lock.release_if_stale(OpKind.MIGRATION, MIGRATION_IDLE_TIMEOUT_SECONDS)
+    if _migration_receiver is not None:
+        await _migration_receiver.expire_stale()
+
+
+def _receiver() -> migration.MigrationReceiver:
+    global _migration_receiver
+    if _migration_receiver is None:
+        _migration_receiver = migration.MigrationReceiver(
+            lock=op_lock, all_app_data=ALL_APP_DATA,
+            work_dir=APP_DATA_DIR / ".migration", router_url=ROUTER_URL,
+            backup_app_name=APP_NAME,
+        )
+    return _migration_receiver
 
 
 # Restore-specific status (not part of the lock itself).
 restore_last_snapshot = None
 restore_last_status = None
+restore_progress: dict | None = None
+_restore_needs_attention = False
+_restore_session: RecoverySession | None = None
 
 # Most recent `restic check` result, surfaced via /api/check/status.
 check_last_status = None
@@ -508,6 +541,25 @@ def _extract_bearer_token() -> str | None:
     return None
 
 
+# Owner-only, read-only probe: the platform's app-definitions parse endpoint
+# rejects an app token, so a successful parse proves owner authority without
+# changing anything. The configured router_api_token is deliberately absent
+# here: it proves what this app may do unattended, never who is calling.
+async def _caller_is_owner() -> str | None:
+    """Return the caller's token when the router confirms owner authority."""
+    token = _extract_bearer_token()
+    if not token:
+        return None
+    return token if await confirm_owner(ROUTER_URL, token) else None
+
+
+def _owner_required_response() -> tuple:
+    return jsonify(
+        ok=False,
+        error="Owner authorization required: send a valid owner Router API token as a Bearer token.",
+    ), 401
+
+
 async def _verify_admin_token(supplied: str | None) -> bool:
     """Return True iff ``supplied`` is a valid admin Bearer token.
 
@@ -584,9 +636,11 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
+    communication = asyncio.create_task(proc.communicate())
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError) as e:
         logger.warning(
             "restic %s killed after %.1fs (%s)",
@@ -594,15 +648,8 @@ async def _run_restic(args: list[str], conf: dict, timeout: float | None = None)
             time.monotonic() - started,
             type(e).__name__,
         )
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        # Reap the child so it doesn't become a zombie.
-        try:
-            await proc.wait()
-        except Exception:
-            pass
+        restic_process.kill_group(proc)
+        await restic_process.finish_communication(communication)
         raise
     logger.info(
         "restic %s -> rc=%s (%.1fs)",
@@ -764,10 +811,11 @@ async def test_restic_connection(
         env=env,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,  # own the group so backend helpers die with it
     )
     buf = bytearray()
 
-    async def drain() -> None:
+    async def read_stderr() -> None:
         assert proc.stderr is not None
         while True:
             chunk = await proc.stderr.read(4096)
@@ -775,24 +823,22 @@ async def test_restic_connection(
                 return
             buf.extend(chunk)
 
-    drain_task = asyncio.create_task(drain())
+    stderr_task = asyncio.create_task(read_stderr())
     timed_out = False
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        try:
-            await proc.wait()
-        except Exception:
-            pass
+        restic_process.kill_group(proc)
+    if timed_out:
+        # Reaping the whole group also drains the pipe to EOF, which is what
+        # unpauses a full pipe transport; nothing of restic's outlives this
+        # request, not even an SSH or rclone helper it started.
+        await restic_process.kill_and_drain(proc)
     try:
-        await asyncio.wait_for(drain_task, timeout=2)
+        await asyncio.wait_for(stderr_task, timeout=2)
     except asyncio.TimeoutError:
-        drain_task.cancel()
+        stderr_task.cancel()
 
     text = bytes(buf).decode(errors="replace")
     if timed_out:
@@ -852,9 +898,54 @@ def _build_restic_debug(conf: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def run_backup(name: str | None = None) -> bool:
-    _reclaim_abandoned_migration()
-    err = op_lock.try_acquire(OpKind.BACKUP)
+def _backup_blocked_reason() -> str | None:
+    """Public reason a new snapshot must wait for an owner, or None."""
+    if _restore_needs_attention:
+        return "Retry or acknowledge the incomplete recovery before running another backup."
+    # This construction is deliberate rather than lazy: the receiver loads its
+    # journal once, so building it here is what makes an interrupted incoming
+    # migration visible to the very first request after a restart. Startup
+    # already refuses to serve when the private work directory is unusable, so
+    # this cannot start failing for a reason the process would survive.
+    if _receiver().needs_attention:
+        return (
+            "Inspect and acknowledge the interrupted incoming migration before running another backup."
+        )
+    if _source_needs_attention():
+        return (
+            "Inspect and acknowledge the interrupted outgoing migration before running another backup."
+        )
+    return None
+
+
+def _source_needs_attention() -> bool:
+    """Outgoing cutover attention, safe to read on the request path."""
+    record = migration.source_recovery
+    return bool(record is not None and record.needs_attention)
+
+
+async def run_backup(name: str | None = None, *, lock_acquired: bool = False) -> bool:
+    if lock_acquired and op_lock.active != OpKind.BACKUP:
+        raise RuntimeError("Backup operation ownership was not reserved")
+    try:
+        blocked = _backup_blocked_reason()
+    except Exception:
+        # The attention records live on disk, so a filesystem failure here must
+        # read as a blocked backup rather than escape into the scheduler.
+        logger.exception(
+            "Could not read the recovery attention records; backups stay blocked until "
+            "the private migration directory is readable and owned by this app's user")
+        if lock_acquired:
+            op_lock.release(OpKind.BACKUP)
+        return False
+    if blocked:
+        logger.warning("Backup paused: %s", blocked)
+        if lock_acquired:
+            op_lock.release(OpKind.BACKUP)
+        return False
+    if not lock_acquired:
+        await _reclaim_abandoned_migration()
+    err = None if lock_acquired else op_lock.try_acquire(OpKind.BACKUP)
     if err:
         logger.warning("Skipping backup: %s", err)
         return False
@@ -886,8 +977,8 @@ async def run_backup(name: str | None = None) -> bool:
 
         tags = _backup_tags(name)
 
-        # Back up candidate roots (app_data, app_temp_data, optional vm_data)
-        # only when present as directories in this container.
+        # Back up the default roots, and only the ones present as directories
+        # in this container.
         roots = [p for p in BACKUP_ROOTS if p.is_dir()]
         if not roots:
             msg = "No backup roots available — expected one of: " + ", ".join(
@@ -896,6 +987,16 @@ async def run_backup(name: str | None = None) -> bool:
             record_backup(timestamp, "error", msg, name=name)
             logger.error(msg)
             return False
+
+        # Missing approval or failed private export is a failed backup, never a
+        # silently incomplete recovery point. No owner key is needed to export;
+        # a configured key additionally captures runtime permissions and states.
+        bundle = await capture_configuration(
+            ROUTER_URL, APP_TOKEN, get_router_api_token() or None, APP_NAME
+        )
+        tags.append(snapshot_configuration.CONFIGURATION_TAG)
+        if bundle["runtime"] is not None:
+            tags.append(snapshot_configuration.RUNTIME_TAG)
 
         args = ["backup", "--json", "--retry-lock", RETRY_LOCK]
         args += [str(p) for p in roots]
@@ -907,6 +1008,8 @@ async def run_backup(name: str | None = None) -> bool:
         # (scope documented at the BACKUP_EXCLUDES definition).
         for ex in BACKUP_EXCLUDES:
             args += ["--exclude", str(ex)]
+        if APP_DATA_DIR not in BACKUP_EXCLUDES:
+            args += ["--exclude", str(APP_DATA_DIR)]
         for t in tags:
             args += ["--tag", t]
 
@@ -915,9 +1018,10 @@ async def run_backup(name: str | None = None) -> bool:
         # is generous for large instances but still finite — a wedged S3
         # connection would otherwise hold the op lock forever.
         try:
-            rc, stdout, stderr = await _run_restic(
-                args, conf, timeout=BACKUP_TIMEOUT_SECONDS
-            )
+            with snapshot_configuration.configuration_file(bundle) as metadata_file:
+                rc, stdout, stderr = await _run_restic(
+                    [*args, str(metadata_file)], conf, timeout=BACKUP_TIMEOUT_SECONDS
+                )
         except asyncio.TimeoutError:
             msg = f"restic backup timed out after {BACKUP_TIMEOUT_SECONDS}s"
             record_backup(timestamp, "error", msg, name=name)
@@ -984,6 +1088,10 @@ async def run_backup(name: str | None = None) -> bool:
         record_backup(timestamp, "error", error_msg, name=name)
         logger.error("Backup failed: %s", error_msg)
         return False
+    except (ConfigurationError, snapshot_configuration.SnapshotConfigurationError) as e:
+        record_backup(timestamp, "error", str(e), name=name)
+        logger.error("Backup configuration capture failed: %s", e)
+        return False
     except Exception as e:
         record_backup(timestamp, "error", str(e), name=name)
         logger.exception("Backup failed")
@@ -1048,6 +1156,8 @@ async def list_snapshots() -> tuple[list[dict], bool]:
                     "paths": e.get("paths", []),
                     "tags": tags,
                     "hostname": e.get("hostname", ""),
+                    "has_configuration": snapshot_configuration.CONFIGURATION_TAG in tags,
+                    "has_runtime": snapshot_configuration.RUNTIME_TAG in tags,
                 }
             )
         # Newest first
@@ -1681,18 +1791,380 @@ def get_backup_history(limit=20, offset=0):
 # ---------------------------------------------------------------------------
 
 
-async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
+def _restore_journal_path() -> Path:
+    return APP_DATA_DIR / ".recovery" / "restore-state.json"
+
+
+def _checkpoint_restore(phase: str, *, needs_attention: bool = False) -> None:
+    global restore_progress, _restore_needs_attention
+    restore_progress = {
+        **(restore_progress or {}),
+        "phase": phase,
+        "needs_attention": needs_attention,
+        "recovery": _restore_session.progress if _restore_session else None,
+    }
+    _restore_needs_attention = needs_attention
+    snapshot_configuration.save_journal(_restore_journal_path(), restore_progress)
+
+
+def _pending_restart_records(saved: dict, *, infer_interrupted: bool = False) -> list[dict]:
+    records = {}
+
+    def add(name, app_id):
+        if (
+            type(name) is not str or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name)
+            or type(app_id) is not str or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{12}", app_id)
+        ):
+            raise ValueError
+        records[name, app_id] = {"name": name, "app_id": app_id}
+
+    pending = saved.get("pending_restarts", [])
+    if type(pending) is not list:
+        raise ValueError
+    for entry in pending:
+        if type(entry) is not dict or set(entry) != {"name", "app_id"}:
+            raise ValueError
+        add(entry["name"], entry["app_id"])
+    recovery = saved.get("recovery") or {}
+    if type(recovery) is not dict:
+        raise ValueError
+    if infer_interrupted:
+        if saved.get("phase") == "stopping":
+            selected = set(saved.get("affected_apps", []))
+            for name, entry in _inventory(recovery.get("destination_apps_before", [])).items():
+                if name not in selected and name != APP_NAME and entry["status"] == "running":
+                    add(name, entry["app_id"])
+        paused = recovery.get("paused_apps", [])
+        if type(paused) is not list:
+            raise ValueError
+        for entry in paused:
+            if type(entry) is not dict:
+                raise ValueError
+            if entry.get("selected") is False and entry.get("previous_status") == "running" and entry.get("restart") != "confirmed":
+                add(entry.get("name"), entry.get("app_id"))
+    return list(records.values())
+
+
+def _load_restore_journal() -> None:
+    global restore_progress, restore_last_status, restore_last_snapshot, _restore_needs_attention
+    path = _restore_journal_path()
+    if not path.exists():
+        return
+    try:
+        if path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            type(saved) is not dict or saved.get("journal_version") != 1
+            or type(saved.get("snapshot")) is not str
+            or not SNAPSHOT_ID_RE.fullmatch(saved["snapshot"])
+            or type(saved.get("job_id")) is not str
+            or not re.fullmatch(r"[a-f0-9]{32}", saved["job_id"])
+            or type(saved.get("phase")) is not str
+            or type(saved.get("affected_apps", [])) is not list
+            or any(type(name) is not str or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", name) for name in saved.get("affected_apps", []))
+            or type(saved.get("affected_roots", [])) is not list
+            or any(root not in {"app_data", "app_temp_data"} for root in saved.get("affected_roots", []))
+        ):
+            raise ValueError
+        retained = saved.get("retained_stages", [])
+        if type(retained) is not list or any(
+            type(entry) is not dict or set(entry) != {"root", "job_id"}
+            or type(entry.get("root")) is not str or entry["root"] not in {"app_data", "app_temp_data"}
+            or type(entry.get("job_id")) is not str or not re.fullmatch(r"[a-f0-9]{32}", entry["job_id"])
+            for entry in retained
+        ):
+            raise ValueError
+        active = saved["phase"] not in {"complete", "incomplete", "error", "acknowledged", "interrupted"}
+        pending_restarts = _pending_restart_records(saved, infer_interrupted=active)
+        _restore_needs_attention = bool(saved.get("needs_attention")) or active or bool(pending_restarts)
+        restore_progress = {
+            "journal_version": 1, "snapshot": saved["snapshot"], "job_id": saved["job_id"],
+            "phase": "interrupted" if active else saved["phase"],
+            "needs_attention": _restore_needs_attention, "recovery": None,
+            "affected_apps": saved.get("affected_apps", []),
+            "affected_roots": saved.get("affected_roots", []),
+            "retained_stages": retained,
+            "pending_restarts": pending_restarts,
+        }
+        if _restore_needs_attention:
+            restore_last_status = "Recovery was interrupted or incomplete. Check the router and retry the snapshot."
+        elif saved["phase"] == "complete":
+            restore_last_status, restore_last_snapshot = "success", saved["snapshot"]
+    except (OSError, ValueError, TypeError, UnicodeError):
+        _restore_needs_attention = True
+        restore_last_status = "The recovery journal could not be read. Check recovery state before running another backup."
+
+
+async def _snapshot_for_restore(snapshot_id: str, conf: dict) -> snapshot_configuration.Snapshot:
+    rc, output, _ = await _run_restic(
+        ["snapshots", "--json", snapshot_id, "--no-lock"], conf, timeout=60
+    )
+    if rc != 0:
+        raise snapshot_configuration.SnapshotConfigurationError("Could not read the selected snapshot.")
+    return snapshot_configuration.snapshot_metadata(snapshot_id, output)
+
+
+async def _snapshot_needs_owner(snapshot_id: str) -> bool:
+    """Whether a whole-snapshot restore of this snapshot needs owner authority.
+
+    A lookup failure answers False: ``run_restore`` re-reads the metadata and
+    still refuses to apply configuration without authority, so an unreadable
+    repository here can only cost a file-only restore, never a bypass.
+    """
+    try:
+        snapshot = await _snapshot_for_restore(snapshot_id, load_config())
+    except Exception:
+        return False
+    return snapshot.has_configuration
+
+
+async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snapshot, conf: dict, owner_token: str) -> bool:
+    global restore_progress, restore_last_status, restore_last_snapshot, _restore_session
+    if not owner_token:
+        raise snapshot_configuration.SnapshotConfigurationError(
+            "Configuration recovery requires owner authorization from the caller."
+        )
+    allowed = {str(path) for path in BACKUP_ROOTS} | {str(snapshot_configuration.CONFIGURATION_FILE)}
+    if any(path not in allowed for path in snapshot.paths):
+        raise snapshot_configuration.SnapshotConfigurationError("This snapshot contains unsupported data roots.")
+    bundle = await snapshot_configuration.read_configuration(snapshot.id, _restic_env(conf))
+    if snapshot.has_runtime != (bundle["runtime"] is not None):
+        raise snapshot_configuration.SnapshotConfigurationError("The configuration does not match the snapshot's runtime metadata tag.")
+    session = RecoverySession(ROUTER_URL, owner_token, bundle, APP_NAME)
+    previous_attention = _restore_needs_attention
+    previous_apps = list((restore_progress or {}).get("affected_apps", [])) if previous_attention else []
+    previous_roots = list((restore_progress or {}).get("affected_roots", [])) if previous_attention else []
+    previous_stages = list((restore_progress or {}).get("retained_stages", []))
+    previous_restarts = list((restore_progress or {}).get("pending_restarts", [])) if previous_attention else []
+    captured_roots = {name for name, path in _ROOT_NAMES.items() if str(path) in snapshot.paths}
+    if previous_attention and (
+        not restore_progress or "affected_apps" not in restore_progress
+        or "affected_roots" not in restore_progress
+        or not set(previous_apps) <= set(session.restore_app_names)
+        or not set(previous_roots) <= captured_roots
+    ):
+        raise snapshot_configuration.SnapshotConfigurationError(
+            "Retry a snapshot covering the interrupted apps, or inspect and acknowledge the previous recovery."
+        )
+    _restore_session = session
+    job_id = uuid.uuid4().hex
+    restore_progress = {
+        "journal_version": 1, "job_id": job_id, "snapshot": snapshot.id,
+        "affected_apps": previous_apps if previous_attention else [],
+        "affected_roots": previous_roots if previous_attention else [],
+        "retained_stages": previous_stages,
+        "pending_restarts": previous_restarts,
+    }
+    stages: dict[Path, Path] = {}
+    rollbacks: dict[Path, Path] = {}
+    modifying = False
+    data_promoted = False
+    cleanup_failed = False
+    committed = False
+
+    async def finalize() -> None:
+        nonlocal cleanup_failed, committed
+        global _restore_session, _restore_needs_attention
+        needs_attention = previous_attention
+        try:
+            try:
+                await session.restart_unaffected()
+            except Exception:
+                # The recovery is reported incomplete either way; the paused-app
+                # journal is what an operator reads, so the cause belongs here.
+                logger.exception("Could not confirm unaffected-app cleanup after recovery")
+                cleanup_failed = True
+            pending = _pending_restart_records(
+                {"pending_restarts": previous_restarts, "recovery": session.progress}, infer_interrupted=True
+            )
+            if pending:
+                try:
+                    inventory = _inventory(await RouterClient(ROUTER_URL, owner_token).get("/api/apps"))
+                    recovered = {app["name"]: app for app in session.summary.get("apps", []) if app.get("ok")}
+                    pending = [entry for entry in pending if not (
+                        entry["name"] in inventory and inventory[entry["name"]]["app_id"] == entry["app_id"]
+                        and (inventory[entry["name"]]["status"] == "running" or (
+                            entry["name"] in recovered
+                            and recovered[entry["name"]].get("app_id") == entry["app_id"]
+                            and recovered[entry["name"]].get("status") == inventory[entry["name"]]["status"]
+                        ))
+                    )]
+                except ConfigurationError:
+                    # An unreachable router cannot confirm these restarts, so
+                    # they stay pending and the recovery needs attention. The
+                    # conservative outcome is kept, but silently so would look
+                    # like apps had restarted.
+                    logger.exception("Could not confirm pending restarts against the router; they stay pending")
+            restore_progress["pending_restarts"] = pending
+            cleanup_failed = cleanup_failed or bool(pending)
+            success = data_promoted and session.summary["ok"] and not cleanup_failed
+            if success:
+                # Every promoted byte must reach stable storage before the
+                # journal may claim this recovery is complete.
+                try:
+                    await drain(asyncio.to_thread(migration.durability_barrier))
+                except Exception:
+                    logger.error("Recovery durability barrier failed", exc_info=True)
+                    cleanup_failed = True
+                    success = False
+            if success:
+                try:
+                    _checkpoint_restore("complete", needs_attention=False)
+                    committed = True
+                except Exception:
+                    # Not durably committed, so the promoted originals stay
+                    # recoverable under their stages.
+                    logger.error("Recovery progress could not be persisted")
+                    cleanup_failed = True
+            needs_attention = False if committed else (
+                previous_attention or modifying or cleanup_failed
+                or bool(restore_progress.get("pending_restarts"))
+            )
+            if not committed and not needs_attention:
+                # Nothing was modified and no earlier job needs review, so a
+                # failed pre-mutation checkpoint must not block every future
+                # backup. Record the error without demanding attention.
+                try:
+                    _checkpoint_restore("error", needs_attention=False)
+                except Exception:
+                    logger.error("Recovery progress could not be persisted")
+            for data_root, stage in stages.items():
+                record = {"root": next(name for name, path in _ROOT_NAMES.items() if path == data_root), "job_id": job_id}
+                if committed:
+                    # Post-commit disposal is garbage collection only. An
+                    # already committed recovery stays successful, and any
+                    # failure keeps the stage and its retained record.
+                    try:
+                        rollback = rollbacks.get(data_root)
+                        if rollback is not None:
+                            await migration.discard_app_trees(rollback)
+                        await asyncio.to_thread(shutil.rmtree, stage)
+                    except Exception:
+                        logger.warning("Retaining staged originals after committed recovery", exc_info=True)
+                        if record not in restore_progress["retained_stages"]:
+                            restore_progress["retained_stages"].append(record)
+                        continue
+                    if record in restore_progress["retained_stages"]:
+                        restore_progress["retained_stages"].remove(record)
+                elif modifying:
+                    # Failed rollback may retain the only original data under
+                    # this stage. Never discard it before a durable commit.
+                    if record not in restore_progress["retained_stages"]:
+                        restore_progress["retained_stages"].append(record)
+                else:
+                    # Nothing was promoted, so the stage holds only a verified
+                    # download that a retry will recreate.
+                    try:
+                        await asyncio.to_thread(shutil.rmtree, stage)
+                    except Exception:
+                        if record not in restore_progress["retained_stages"]:
+                            restore_progress["retained_stages"].append(record)
+                    else:
+                        if record in restore_progress["retained_stages"]:
+                            restore_progress["retained_stages"].remove(record)
+            _restore_needs_attention = needs_attention
+        finally:
+            final_phase = "complete" if committed else ("incomplete" if needs_attention else "error")
+            try:
+                _checkpoint_restore(final_phase, needs_attention=needs_attention)
+            except Exception:
+                logger.error("Final recovery progress could not be persisted", exc_info=True)
+                # An unreliable journal must not be papered over: anything this
+                # run modified keeps the recovery gated for owner inspection.
+                if needs_attention or modifying or committed:
+                    _restore_needs_attention = True
+            _restore_session = None
+    try:
+        _checkpoint_restore("preflight", needs_attention=previous_attention)
+        await session.preflight()
+        _checkpoint_restore("staging", needs_attention=previous_attention)
+        # Download/verify before stopping any application. Each staging tree is
+        # on the destination filesystem so the final directory promotion is an
+        # atomic rename, including when persistent and temporary mounts differ.
+        for data_root in (ALL_APP_DATA, APP_TEMP_DATA):
+            if str(data_root) not in snapshot.paths:
+                continue
+            if not data_root.is_dir() or data_root.is_symlink():
+                raise snapshot_configuration.SnapshotConfigurationError("A destination app-data root is unavailable.")
+            parent = data_root / RESTORE_WORK_NAME
+            snapshot_configuration._private_directory(parent)
+            stage = parent / job_id
+            stage.mkdir(mode=0o700)
+            stages[data_root] = stage
+            rc, _, _ = await _run_restic(
+                ["restore", "--retry-lock", RETRY_LOCK, snapshot.id,
+                 "--target", str(stage), "--include", str(data_root), "--verify"],
+                conf, timeout=RESTORE_TIMEOUT_SECONDS,
+            )
+            payload = stage / str(data_root).lstrip("/")
+            if rc != 0 or not payload.is_dir() or payload.is_symlink():
+                raise snapshot_configuration.SnapshotConfigurationError("App data could not be fully staged and verified.")
+            # A missing app directory is explicit empty data in a captured root.
+            for name in session.restore_app_names:
+                candidate = payload / name
+                if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+                    raise snapshot_configuration.SnapshotConfigurationError("A snapshot app-data root is not a directory.")
+                candidate.mkdir(exist_ok=True)
+            if data_root == ALL_APP_DATA:
+                captured = {entry.name for entry in payload.iterdir()
+                            if entry.is_dir() and not entry.is_symlink()}
+                session.note_omitted_data(captured - set(session.restore_app_names))
+        restore_progress["affected_apps"] = sorted(set(previous_apps) | set(session.restore_app_names))
+        restore_progress["affected_roots"] = sorted(set(previous_roots) | captured_roots)
+        _checkpoint_restore("stopping", needs_attention=True)
+        modifying = True
+        await session.stop_apps()
+        # Persist the location before promotion can move original directories
+        # into rollback storage. A process crash cannot erase this breadcrumb.
+        for data_root in stages:
+            record = {"root": next(name for name, path in _ROOT_NAMES.items() if path == data_root), "job_id": job_id}
+            if record not in restore_progress["retained_stages"]:
+                restore_progress["retained_stages"].append(record)
+        _checkpoint_restore("restoring_data", needs_attention=True)
+        for data_root, stage in stages.items():
+            payload = stage / str(data_root).lstrip("/")
+            # Keep the rollback token for every promoted root until the whole
+            # recovery is durably committed; a later root can still fail.
+            rollbacks[data_root] = await migration.replace_app_trees(
+                payload, data_root, session.restore_app_names
+            )
+        data_promoted = True
+        _checkpoint_restore("activating", needs_attention=True)
+        await session.activate()
+    finally:
+        await drain(finalize())
+    result = session.summary
+    if result["ok"] and not cleanup_failed and committed:
+        restore_last_snapshot, restore_last_status = snapshot.id, "success"
+        return True
+    restore_last_status = "Recovery is incomplete. Review the app results before retrying or acknowledging it."
+    return False
+
+
+async def run_restore(snapshot_id: str, root: str | None = None, owner_token: str | None = None, *, lock_acquired: bool = False) -> bool:
     """Restore a snapshot.
 
-    If ``root`` is None, every captured path in the snapshot is
-    restored. Otherwise only the named root (``app_data``,
-    ``app_temp_data``, or ``vm_data``) is touched via restic's
-    ``--include`` filter.
-    """
-    global restore_last_snapshot, restore_last_status
+    With ``root`` None a snapshot that carries configuration is recovered
+    through the owner-only configuration path, which needs ``owner_token``
+    confirmed by the router. A configuration snapshot requested with a named
+    root, or one whose caller is not the owner, degrades to a file-only
+    restore that writes captured files in place and applies no definitions,
+    API keys or app state.
 
-    _reclaim_abandoned_migration()
-    err = op_lock.try_acquire(OpKind.RESTORE)
+    A named root (``app_data``, ``app_temp_data``, or the legacy ``vm_data``)
+    is selected with restic ``--exclude`` filters for the other captured
+    paths, never ``--include``, so the backup executor and its repository stay
+    protected in every mode. ``vm_data`` is only ever present in snapshots
+    taken by a version that captured it.
+    """
+    global restore_last_snapshot, restore_last_status, restore_progress
+
+    if lock_acquired and op_lock.active != OpKind.RESTORE:
+        raise RuntimeError("Restore operation ownership was not reserved")
+    if not lock_acquired:
+        await _reclaim_abandoned_migration()
+    err = None if lock_acquired else op_lock.try_acquire(OpKind.RESTORE)
     if err:
         logger.warning("Skipping restore: %s", err)
         return False
@@ -1720,26 +2192,44 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         return False
 
     logger.info("Starting restic restore from %s (root=%s)", snapshot_id, root or "all")
+    restore_last_snapshot, restore_last_status = None, None
 
     try:
+        snapshot = await _snapshot_for_restore(snapshot_id, conf)
+        if root is None and snapshot.has_configuration:
+            if not owner_token:
+                # Reached only when a caller without owner authority asked for
+                # a configuration snapshot. Refuse before reading the bundle.
+                raise snapshot_configuration.SnapshotConfigurationError(
+                    "Configuration recovery requires owner authorization from the caller."
+                )
+            return await _restore_configuration_snapshot(snapshot, conf, owner_token)
+        if _restore_needs_attention:
+            raise snapshot_configuration.SnapshotConfigurationError("Retry the interrupted full recovery before restoring individual roots.")
+        restore_progress = {
+            **(restore_progress or {}),
+            "phase": "files_only", "has_configuration": snapshot.has_configuration,
+            "snapshot": snapshot.id, "recovery": None,
+            "warnings": ["File-only restore: app definitions, API keys, and application state are not applied."],
+        }
         args = [
             "restore",
             "--retry-lock",
             RETRY_LOCK,
-            snapshot_id,
+            snapshot.id,
             "--target",
             "/",  # restic restores the absolute paths as they were captured
         ]
-        # restic 0.17 forbids mixing --include and --exclude in one
-        # restore. When restoring a specific root we use --include
-        # (narrowing); otherwise we use --exclude so we don't clobber
-        # our own data directory or the archive tier (which the backup
-        # never captured in the first place — see BACKUP_EXCLUDES).
+        # Use exclusions only, including for a single selected root, so the
+        # backup executor and its repository stay protected in every mode.
         if root:
-            args += ["--include", str(_ROOT_NAMES[root])]
-        else:
-            for ex in BACKUP_EXCLUDES:
-                args += ["--exclude", str(ex)]
+            if str(_ROOT_NAMES[root]) not in snapshot.paths:
+                raise snapshot_configuration.SnapshotConfigurationError("The selected root was not captured in this snapshot.")
+            for path in snapshot.paths:
+                if path != str(_ROOT_NAMES[root]):
+                    args += ["--exclude", path]
+        for ex in (*BACKUP_EXCLUDES, APP_DATA_DIR, snapshot_configuration.CONFIGURATION_FILE):
+            args += ["--exclude", str(ex)]
         try:
             rc, _stdout, stderr = await _run_restic(
                 args, conf, timeout=RESTORE_TIMEOUT_SECONDS
@@ -1758,9 +2248,17 @@ async def run_restore(snapshot_id: str, root: str | None = None) -> bool:
         else:
             restore_last_status = f"error: {stderr.decode(errors='replace').strip() or f'restic exit {rc}'}"
             logger.error("Restore failed: %s", restore_last_status)
-    except Exception as e:
+    except (ConfigurationError, snapshot_configuration.SnapshotConfigurationError) as e:
         restore_last_status = f"error: {e}"
-        logger.exception("Restore failed")
+        logger.error("Recovery failed: %s", e)
+    except asyncio.CancelledError:
+        restore_last_status = "Recovery was interrupted. Check the router and retry the snapshot."
+        raise
+    except Exception as e:
+        restore_last_status = "error: recovery failed; inspect the backup and router status before retrying"
+        # Only the exception type: restic and router messages can carry
+        # repository paths, credentials or captured data.
+        logger.error("Restore failed (%s)", type(e).__name__)
     finally:
         op_lock.release(OpKind.RESTORE)
 
@@ -1846,8 +2344,15 @@ async def run_check() -> bool:
 async def scheduler_loop():
     first_run = True
     while True:
-        conf = load_config()
-        interval = conf["interval_seconds"]
+        try:
+            conf = load_config()
+            interval = conf["interval_seconds"]
+        except Exception:
+            # A scheduler that exits on a transient read error never runs
+            # another automatic backup, so keep the loop alive instead.
+            logger.exception("Could not read the backup schedule")
+            await asyncio.sleep(30)
+            continue
 
         if not interval or not conf.get("repo"):
             await asyncio.sleep(30)
@@ -1872,7 +2377,11 @@ async def scheduler_loop():
 
         logger.info("Next backup in %d seconds", int(wait))
         await asyncio.sleep(wait)
-        await run_backup()
+        try:
+            await run_backup()
+        except Exception:
+            # Only cancellation may leave this loop; a failed backup retries.
+            logger.exception("Scheduled backup failed unexpectedly")
 
 
 def ensure_default_config():
@@ -1890,6 +2399,28 @@ async def startup():
     global scheduler_task
     init_db()
     ensure_default_config()
+    snapshot_configuration.clear_configuration_file()
+    _load_restore_journal()
+    # Outgoing cutover intent must be visible before any capture can run, so an
+    # interrupted migration blocks new work from the first request. Without that
+    # record a capture could copy half-migrated data, so fail closed.
+    try:
+        migration.initialize_source_recovery(
+            lock=op_lock, all_app_data=ALL_APP_DATA,
+            work_dir=APP_DATA_DIR / ".migration", router_url=ROUTER_URL,
+            backup_app_name=APP_NAME,
+        )
+    except (migration.MigrationError, migration_data.DataError) as error:
+        # The record is what makes an interrupted cutover visible, so an
+        # unusable private directory must be named rather than surfacing as an
+        # opaque data error from deep in the staging helpers.
+        logger.error(
+            "Outgoing migration state unavailable in %s; refusing to start because a "
+            "capture could copy half-migrated data. That directory must exist, be a "
+            "real directory, and be owned by this app's user (mode 0700): %s",
+            APP_DATA_DIR / ".migration", error,
+        )
+        raise
     # Push op_lock transitions to connected SSE clients so the status banner
     # updates the instant an operation starts or finishes.
     op_lock.set_on_change(_notify_status_change)
@@ -1955,6 +2486,7 @@ async def index():
         state=state,
         backend=backend,
         scope=_backup_scope_summary(),
+        app_name=APP_NAME,
     )
 
 
@@ -1997,7 +2529,7 @@ def _backup_scope_summary() -> dict:
                 "JuiceFS metadata as well as the S3 objects."
             )
             user_facing = True
-        elif p == ALL_APP_DATA / "backup":
+        elif p in {ALL_APP_DATA / APP_NAME, APP_TEMP_DATA / APP_NAME} or p.name == RESTORE_WORK_NAME:
             reason = (
                 "The entire backup app data directory is excluded, including "
                 "configuration, backup history, and any local restic repository "
@@ -2017,7 +2549,10 @@ def _backup_scope_summary() -> dict:
             }
         )
 
-    return {"included": included, "excluded": excluded}
+    return {
+        "included": included, "excluded": excluded,
+        "configuration": {"included": True, "runtime_configured": bool(get_router_api_token())},
+    }
 
 
 @route("/api/config", methods=["GET"])
@@ -2120,11 +2655,23 @@ async def api_repo_test():
 
 @route("/api/backup", methods=["POST"])
 async def trigger_backup():
-    if op_lock.busy:
-        return jsonify(ok=False, error=op_lock.busy_message()), 409
+    blocked = _backup_blocked_reason()
+    if blocked:
+        return jsonify(ok=False, error=blocked), 409
     data = await request.get_json(silent=True) or {}
+    if type(data) is not dict or (data.get("name") is not None and type(data["name"]) is not str):
+        return jsonify(ok=False, error="Invalid backup request."), 400
     name = (data.get("name") or "").strip() or None
-    asyncio.create_task(run_backup(name=name))
+    await _reclaim_abandoned_migration()
+    # Reclaiming can adopt an interrupted migration, so the reason is read
+    # once, after the await, and used for both the decision and the response.
+    blocked = _backup_blocked_reason()
+    if blocked:
+        return jsonify(ok=False, error=blocked), 409
+    error = op_lock.try_acquire(OpKind.BACKUP)
+    if error:
+        return jsonify(ok=False, error=error), 409
+    _spawn_background(run_backup(name=name, lock_acquired=True))
     return jsonify(ok=True, message="Backup started")
 
 
@@ -2216,16 +2763,35 @@ async def api_repo_stats():
 
 @route("/api/restore", methods=["POST"])
 async def trigger_restore():
-    if op_lock.busy:
-        return jsonify(ok=False, error=op_lock.busy_message()), 409
     data = await request.get_json()
+    if type(data) is not dict:
+        return jsonify(ok=False, error="Invalid restore request."), 400
     snapshot_id = data.get("snapshot", "")
-    if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
+    if type(snapshot_id) is not str or not SNAPSHOT_ID_RE.fullmatch(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
-    root = data.get("root") or None
+    root = data.get("root")
+    if root is not None and type(root) is not str:
+        return jsonify(ok=False, error="Invalid restore root."), 400
+    root = root or None
     if root is not None and root not in _ROOT_NAMES:
         return jsonify(ok=False, error=f"Unknown root: {root}"), 400
-    asyncio.create_task(run_restore(snapshot_id, root=root))
+    # A co-located container can reach this app directly, so a snapshot that
+    # carries app definitions and API-key verifiers may only be applied for a
+    # caller the router confirms is the owner. Legacy file-only restores keep
+    # their existing behavior.
+    caller_token = _extract_bearer_token()
+    if caller_token and not await _caller_is_owner():
+        return _owner_required_response()
+    if not caller_token and root is None and await _snapshot_needs_owner(snapshot_id):
+        # Applying captured definitions and key verifiers is owner-only, so say
+        # so now rather than letting a background job fail after it started.
+        # Legacy file-only snapshots still restore without a token.
+        return _owner_required_response()
+    await _reclaim_abandoned_migration()
+    error = op_lock.try_acquire(OpKind.RESTORE)
+    if error:
+        return jsonify(ok=False, error=error), 409
+    _spawn_background(run_restore(snapshot_id, root=root, owner_token=caller_token, lock_acquired=True))
     return jsonify(ok=True, message="Restore started")
 
 
@@ -2235,7 +2801,38 @@ async def restore_status_endpoint():
         running=op_lock.restore_running,
         last_restore=restore_last_snapshot,
         last_status=restore_last_status,
+        needs_attention=_restore_needs_attention,
+        progress={**(restore_progress or {}), "recovery": _restore_session.progress} if _restore_session else restore_progress,
     )
+
+
+@route("/api/restore/acknowledge", methods=["POST"])
+async def acknowledge_restore():
+    global _restore_needs_attention, restore_progress
+    # Acknowledging unblocks the destructive retry, so it needs the same owner
+    # authority as the recovery it clears.
+    if not await _caller_is_owner():
+        return _owner_required_response()
+    if op_lock.busy:
+        return jsonify(ok=False, error=op_lock.busy_message()), 409
+    if not _restore_needs_attention:
+        return jsonify(ok=True)
+    candidate = {
+        **(restore_progress or {}), "phase": "acknowledged", "needs_attention": False,
+        "affected_apps": [], "affected_roots": [], "pending_restarts": [], "recovery": None,
+    }
+    try:
+        if restore_progress and "job_id" in restore_progress:
+            snapshot_configuration.save_journal(_restore_journal_path(), candidate)
+        else:
+            if _restore_journal_path().parent.is_symlink():
+                raise ValueError
+            _restore_journal_path().unlink(missing_ok=True)
+    except Exception:
+        return jsonify(ok=False, error="The recovery notice could not be acknowledged. Check the backup's writable storage."), 500
+    restore_progress = candidate
+    _restore_needs_attention = False
+    return jsonify(ok=True)
 
 
 @route("/api/snapshot/files")
@@ -2286,7 +2883,7 @@ async def trigger_check():
         return jsonify(ok=False, error=op_lock.busy_message()), 409
     if check_running:
         return jsonify(ok=False, error="check already running"), 409
-    asyncio.create_task(run_check())
+    _spawn_background(run_check())
     return jsonify(ok=True, message="Check started")
 
 
@@ -2363,7 +2960,7 @@ async def api_router_test():
         return jsonify(ok=False, error="No router API token provided or configured"), 400
     try:
         apps = await _get_router_apps(token)
-        app_names = [n for n in apps if n != "backup"]
+        app_names = [n for n in apps if n != APP_NAME]
         return jsonify(
             ok=True,
             message=f"Connected to router successfully ({len(app_names)} apps found)",
@@ -2413,14 +3010,14 @@ async def _running_selected_apps(
 ) -> list[str]:
     """Names of targeted non-backup apps that are not stopped.
 
-    ``backup`` is always excluded — it serves the request doing the asking,
-    so it can never be stopped first.
+    This app is always excluded under its own (configurable) name: it serves
+    the request doing the asking, so it can never be stopped first.
     """
     apps = await _get_router_apps(router_token)
     return [
         name
         for name, info in apps.items()
-        if name != "backup"
+        if name != APP_NAME
         and (selected_apps is None or name in selected_apps)
         and info.get("status") in _ACTIVE_STATUSES
     ]
@@ -2442,7 +3039,7 @@ async def stop_all_apps():
         stopped = []
         async with httpx.AsyncClient(verify=False, timeout=30) as client:
             for app_name, info in apps.items():
-                if app_name == "backup":
+                if app_name == APP_NAME:
                     continue
                 if selected_apps and app_name not in selected_apps:
                     continue
@@ -2564,13 +3161,31 @@ async def chown_app_data():
 @route("/api/migration/status")
 async def migration_status_endpoint():
     idle = op_lock.idle_seconds() if op_lock.migration_running else None
+    incoming = _receiver().journal_status
+    displayed = migration.status
+    if incoming and (displayed is None or incoming.get("phase") in {"preflighting", "receiving", "finalizing"}):
+        phase = incoming.get("phase", "interrupted")
+        displayed = {
+            "phase": "done" if phase == "complete" else "error" if phase in {"failed", "incomplete", "interrupted", "aborted"} else phase,
+            "progress": 100 if phase == "complete" else 0,
+            "error": None if phase == "complete" else "Review incoming migration results.",
+        }
     return jsonify(
+        version=migration.MIGRATION_PROTOCOL_VERSION,
         running=op_lock.migration_running,
         stale=idle is not None and idle > MIGRATION_IDLE_TIMEOUT_SECONDS,
         idle_seconds=round(idle) if idle is not None else None,
-        status=migration.status,
+        status=displayed,
         log=migration.log[-50:],
+        receive=incoming,
+        source_recovery=_source_recovery_status(),
     )
+
+
+def _source_recovery_status() -> dict | None:
+    """Outgoing cutover record for the UI; carries no tokens or bundle data."""
+    record = migration.source_recovery
+    return record.journal_status if record is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -2580,133 +3195,66 @@ async def migration_status_endpoint():
 
 @route("/api/migration/push", methods=["POST"])
 async def trigger_direct_push():
-    """One-click migration: push all apps + data to another instance."""
-    _reclaim_abandoned_migration()
+    """The retained source job owns capture, quiescence, transfer and cleanup."""
+    data = await request.get_json(silent=True) or {}
+    if type(data) is not dict or set(data) - {"target_url", "target_token", "apps"}:
+        return jsonify(ok=False, error="Invalid migration request."), 400
+    if type(data.get("target_url")) is not str or type(data.get("target_token")) is not str:
+        return jsonify(ok=False, error="Destination URL and API token are required."), 400
+    target_url = (data.get("target_url") or "").rstrip("/")
+    target_token = data.get("target_token") or ""
+    if not target_url.strip() or not target_token.strip():
+        return jsonify(ok=False, error="Destination URL and API token are required."), 400
+    raw_apps = data.get("apps")
+    if raw_apps is not None and not isinstance(raw_apps, (list, str)):
+        return jsonify(ok=False, error="'apps' must be a list or string"), 400
+    if raw_apps == []:
+        return jsonify(ok=False, error="Select at least one app."), 400
+    selected_apps = _parse_selected_apps(raw_apps)
+    # Outgoing migration captures definitions and API-key verifiers and sends
+    # them to a destination URL, so only a caller the router confirms as owner
+    # may start one. The configured token is never proof of caller identity.
+    router_token = await _caller_is_owner()
+    if not router_token:
+        return _owner_required_response()
+    await _reclaim_abandoned_migration()
+    if _restore_needs_attention:
+        # Source preflight only checks router state, so it cannot see app trees
+        # left uncertain by an interrupted restore on this instance.
+        return jsonify(
+            ok=False,
+            error="Retry or acknowledge the incomplete recovery before migrating this instance.",
+        ), 409
+    if _receiver().needs_attention:
+        # This instance's own data is in an uncertain state. Migrating it
+        # outward would copy half-replaced app trees to the destination.
+        return jsonify(
+            ok=False,
+            error="Inspect and acknowledge the interrupted incoming migration before migrating again.",
+        ), 409
+    if _source_needs_attention():
+        # The previous cutover from this instance is unresolved, so apps may be
+        # stopped and app states unverified.
+        return jsonify(
+            ok=False,
+            error="Inspect and acknowledge the interrupted outgoing migration before migrating again.",
+        ), 409
     err = op_lock.try_acquire(OpKind.MIGRATION)
     if err:
         return jsonify(ok=False, error=err), 409
-
-    data = await request.get_json(silent=True) or {}
-    target_url = (data.get("target_url") or "").rstrip("/")
-    target_token = data.get("target_token") or ""
-
-    if not target_url:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing target_url"), 400
-    if not target_token:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing target_token"), 400
-
-    raw_apps = data.get("apps")
-    if raw_apps is not None and not isinstance(raw_apps, (list, str)):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="'apps' must be a list or string"), 400
-    selected_apps = _parse_selected_apps(raw_apps)
-
-    router_token = _extract_bearer_token() or get_router_api_token()
-
-    # Pre-flight check: verify the router token works before starting.
-    # Without a valid token the migration will fail when it tries to
-    # list apps on this instance.
-    if router_token:
-        import httpx
-
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=10) as client:
-                r = await client.get(
-                    f"{ROUTER_URL}/api/apps",
-                    headers={"Authorization": f"Bearer {router_token}"},
-                )
-                if (
-                    r.status_code != 200
-                    or r.headers.get("content-type", "").find("json") == -1
-                ):
-                    op_lock.release(OpKind.MIGRATION)
-                    return jsonify(
-                        ok=False,
-                        error="Router API token is invalid or expired. "
-                        "Go to the Migrate tab and update your Router API Token. "
-                        "You can generate a token from the Cloud in a Bottle dashboard "
-                        "under API Tokens.",
-                    ), 400
-        except Exception:
-            pass  # Network issue; let the migration try anyway
-    else:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False,
-            error="No router API token configured. The backup app needs a "
-            "token to access the local router API during migration. "
-            "Set one in the Router API Token section on the Migrate tab.",
-        ), 400
-
-    # Pre-flight: the apps being moved must be stopped. A live app writes to
-    # its data dir while we tar it, so the destination would receive a torn
-    # copy (half-written SQLite pages, partial uploads) that looks like a
-    # successful migration.
-    try:
-        running = await _running_selected_apps(router_token, selected_apps)
-    except Exception as e:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error=f"Could not check app status: {e}"), 500
-    if running:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False,
-            error=f"Apps still running: {', '.join(running)}. "
-            "Stop them before migrating.",
-        ), 409
-
-    # Pre-flight: the destination must have the backup app installed and must
-    # accept the provided token before we start a background push.
-    import httpx
-
-    target_backup_url = migration._target_backup_url(target_url)
-    try:
-        async with httpx.AsyncClient(
-            verify=not migration._is_local_url(target_backup_url), timeout=15
-        ) as client:
-            tr = await client.get(
-                f"{target_backup_url}/api/migration/status",
-                headers={"Authorization": f"Bearer {target_token}"},
-            )
-    except Exception as e:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False,
-            error=f"Could not reach the destination backup app at {target_backup_url}: {e}",
-        ), 400
-    if tr.status_code == 404:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False,
-            error="The backup app is not installed on the destination instance. "
-            "Install it there, then retry.",
-        ), 400
-    if tr.status_code in (401, 403) or "json" not in tr.headers.get("content-type", ""):
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False,
-            error="The destination rejected the API token. Check the destination "
-            "API token and try again.",
-        ), 400
-    if tr.status_code != 200:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(
-            ok=False, error=f"Destination backup app returned HTTP {tr.status_code}."
-        ), 400
-
-    asyncio.create_task(
+    _spawn_background(
         migration.run_direct_push(
             target_url=target_url,
             target_token=target_token,
             selected_apps=selected_apps,
             lock=op_lock,
             all_app_data=ALL_APP_DATA,
-            vm_data_dir=VM_DATA_DIR,
+            work_dir=APP_DATA_DIR / ".migration",
             router_url=ROUTER_URL,
-            zone_domain=ZONE_DOMAIN,
-            router_token=router_token,
+            app_token=APP_TOKEN,
+            owner_token=router_token,
+            backup_app_name=APP_NAME,
+            lock_acquired=True,
         )
     )
     return jsonify(ok=True, message="Direct push migration started")
@@ -2719,130 +3267,132 @@ async def trigger_direct_push():
 
 @route("/api/migration/receive/start", methods=["POST"])
 async def receive_start():
-    """Accept a migration manifest from a source instance.
-
-    Acquires the operation lock to prevent concurrent backup/restore,
-    stops all non-backup apps, and deletes app data for migrated apps.
-    The lock is held until receive_finalize completes.
-    """
-    # A previous migration whose source died can leave the lock held; reclaim it
-    # so a retried migration proceeds without an app restart (issue #14).
-    _reclaim_abandoned_migration()
-    err = op_lock.try_acquire(OpKind.MIGRATION)
-    if err:
-        return jsonify(ok=False, error=err), 409
-    data = await request.get_json(silent=True) or {}
-    if not data:
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing manifest"), 400
-    router_token = _extract_bearer_token() or get_router_api_token()
-    try:
-        result = await migration.receive_start(
-            data, ALL_APP_DATA, ROUTER_URL, router_token
-        )
-    except Exception as e:
-        logger.exception("receive_start failed")
-        op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error=str(e)), 500
-    if not result.get("ok"):
-        op_lock.release(OpKind.MIGRATION)
-    # Lock stays held on success — released by receive_finalize
-    code = 200 if result.get("ok") else 400
-    return jsonify(**result), code
+    token = _receive_owner_token()
+    return jsonify(await _receiver().start(await _migration_json(), owner_token=token))
 
 
 @route("/api/migration/receive/app/<app_name>", methods=["POST"])
 async def receive_app(app_name):
-    """Receive a tar.gz stream of a single app's data (backward compat)."""
-    if not migration.validate_name(app_name):
-        return jsonify(ok=False, error="Invalid app name"), 400
-    op_lock.touch()  # keep the migration lock fresh during a live transfer
-    tar_data = await request.get_data()
-    if not tar_data:
-        return jsonify(ok=False, error="Empty request body"), 400
-    result = await migration.receive_app_data(app_name, tar_data, ALL_APP_DATA)
-    code = 200 if result.get("ok") else 400
-    return jsonify(**result), code
+    raise migration.MigrationError("protocol")
+
+
+@route("/api/migration/receive/chunk/<session_id>/<app_name>", methods=["POST"])
+async def receive_chunk(session_id, app_name):
+    token = _receive_owner_token()
+    index = request.headers.get("X-Chunk-Index", "")
+    size = request.headers.get("X-Archive-Bytes", "")
+    final = request.headers.get("X-Chunk-Final", "")
+    digest = request.headers.get("X-Archive-SHA256", "")
+    if (
+        not re.fullmatch(r"[0-9]{1,12}", index) or not re.fullmatch(r"[0-9]{1,18}", size)
+        or final not in {"0", "1"} or not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        raise migration.MigrationError("invalid")
+    return jsonify(await _receiver().upload(
+        session_id, app_name, request.body, index=int(index), final=final == "1",
+        archive_bytes=int(size), archive_sha256=digest, owner_token=token,
+    ))
 
 
 @route("/api/migration/receive/chunk/<app_name>", methods=["POST"])
-async def receive_chunk(app_name):
-    """Receive one chunk of a large app's tar.gz data."""
-    if not migration.validate_name(app_name):
-        return jsonify(ok=False, error="Invalid app name"), 400
-    op_lock.touch()  # keep the migration lock fresh during a live transfer
-    chunk_data = await request.get_data()
-    if not chunk_data:
-        return jsonify(ok=False, error="Empty chunk"), 400
-    chunk_index = int(request.headers.get("X-Chunk-Index", "0"))
-    is_final = request.headers.get("X-Chunk-Final", "0") == "1"
-    result = await migration.receive_chunk(
-        app_name, chunk_data, chunk_index, is_final, ALL_APP_DATA
-    )
-    code = 200 if result.get("ok") else 400
-    return jsonify(**result), code
+async def receive_legacy_chunk(app_name):
+    raise migration.MigrationError("protocol")
 
 
 @route("/api/migration/receive/data", methods=["POST"])
 async def receive_data():
-    """Receive a tar.gz stream of all app data.
-
-    Streams the request body to a temp file to avoid buffering the
-    entire archive in memory, then extracts from the file.
-    """
-    import tempfile as _tempfile
-
-    op_lock.touch()  # keep the migration lock fresh during a live transfer
-    # Stream request body to a temp file instead of buffering in memory.
-    # Quart's request.get_data() would load everything into RAM; for
-    # multi-GB archives that OOMs the container.
-    tmp = _tempfile.NamedTemporaryFile(
-        dir=str(APP_DATA_DIR), suffix=".tar.gz", delete=False
-    )
-    try:
-        total = 0
-        async for chunk in request.body:
-            tmp.write(chunk)
-            total += len(chunk)
-        tmp.close()
-
-        if total == 0:
-            os.unlink(tmp.name)
-            return jsonify(ok=False, error="Empty request body"), 400
-
-        result = await migration.receive_all_data_from_file(tmp.name, ALL_APP_DATA)
-        code = 200 if result.get("ok") else 400
-        return jsonify(**result), code
-    except Exception as e:
-        logger.exception("receive_data failed")
-        return jsonify(ok=False, error=str(e)), 500
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+    raise migration.MigrationError("protocol")
 
 
 @route("/api/migration/receive/finalize", methods=["POST"])
 async def receive_finalize():
-    """Deploy/restart apps after data has been received. Releases the op lock."""
-    data = await request.get_json(silent=True) or {}
-    manifest = data.get("manifest", {})
-    if not manifest:
-        if op_lock.active == OpKind.MIGRATION:
-            op_lock.release(OpKind.MIGRATION)
-        return jsonify(ok=False, error="Missing manifest"), 400
-    repo_urls = data.get("repo_urls")
-    router_token = _extract_bearer_token() or get_router_api_token()
+    token = _receive_owner_token()
+    return jsonify(await _receiver().finalize(await _migration_json(), owner_token=token))
+
+
+def _receive_owner_token() -> str:
+    token = _extract_bearer_token()
+    if not token:
+        raise migration.MigrationError("auth")
+    return token
+
+
+async def _migration_json() -> dict:
+    if not request.is_json:
+        raise migration.MigrationError("invalid")
+    content = bytearray()
+    async for chunk in request.body:
+        if len(content) + len(chunk) > migration.MAX_JSON_BYTES:
+            raise migration.MigrationError("invalid")
+        content.extend(chunk)
+
+    def unique_pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
     try:
-        result = await migration.receive_finalize(
-            manifest, ROUTER_URL, router_token, repo_urls=repo_urls
-        )
-        return jsonify(**result)
-    finally:
-        # Only release if we actually hold the migration lock
-        if op_lock.active == OpKind.MIGRATION:
-            op_lock.release(OpKind.MIGRATION)
+        value = json.loads(content.decode("utf-8"), object_pairs_hook=unique_pairs)
+        if type(value) is not dict:
+            raise ValueError
+        return value
+    except (ValueError, UnicodeError, RecursionError):
+        raise migration.MigrationError("invalid") from None
+
+
+@app.errorhandler(migration.MigrationError)
+async def migration_error(error):
+    return jsonify(ok=False, error=str(error)), error.status_code
+
+
+@route("/api/migration/receive/capabilities")
+async def receive_capabilities():
+    token = _receive_owner_token()
+    return jsonify(await _receiver().capabilities(owner_token=token))
+
+
+@route("/api/migration/receive/status/<session_id>")
+async def receive_status(session_id):
+    token = _receive_owner_token()
+    return jsonify(await _receiver().status(session_id, owner_token=token))
+
+
+@route("/api/migration/acknowledge", methods=["POST"])
+async def migration_acknowledge():
+    """Clear an interrupted incoming-migration notice without touching data."""
+    token = await _caller_is_owner()
+    if not token:
+        return _owner_required_response()
+    state = await _receiver().acknowledge(owner_token=token)
+    return jsonify(state if type(state) is dict else {"ok": True, "needs_attention": False})
+
+
+@route("/api/migration/source-acknowledge", methods=["POST"])
+async def migration_source_acknowledge():
+    """Clear an interrupted outgoing-migration notice without touching data."""
+    token = await _caller_is_owner()
+    if not token:
+        return _owner_required_response()
+    record = migration.source_recovery
+    if record is None:
+        return jsonify(ok=True, needs_attention=False, journal_status=None)
+    state = await record.acknowledge(owner_token=token)
+    return jsonify(state if type(state) is dict else {"ok": True, "needs_attention": False})
+
+
+@route("/api/migration/receive/abort", methods=["POST"])
+async def receive_abort():
+    token = _receive_owner_token()
+    return jsonify(await _receiver().abort(await _migration_json(), owner_token=token))
+
+
+@route("/api/migration/receive/keepalive", methods=["POST"])
+async def receive_keepalive():
+    token = _receive_owner_token()
+    return jsonify(await _receiver().keepalive(await _migration_json(), owner_token=token))
 
 
 @route("/health")
