@@ -61,6 +61,7 @@ _ERRORS = {
     "invalid_sequence": "Recovery steps must run once in preflight, stop, restore-data, activate order.",
     "stop_failed": "An app could not be confirmed stopped. Data restoration must not proceed.",
     "deployment_failed": "An app deployment failed. Check the app in the router.",
+    "deployment_pending": "An app was still building or starting when the recovery deadline passed. It did not fail, and it may still reach running on its own; reload it in the router to confirm.",
     "deployment_timeout": "An app did not become ready before the recovery deadline.",
     "install_unknown": "An install response was lost and the app could not be identified. Check the router before retrying.",
     "provider_unavailable": "A required service provider is unavailable or not ready.",

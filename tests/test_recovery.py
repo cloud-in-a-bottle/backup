@@ -33,6 +33,10 @@ from tests.test_configuration import (
     provider_entry,
 )
 
+# A router-served service URL that this platform build does not register, as
+# seen live on the default catalog app.
+INSTALLER = "github.com/cloud-in-a-bottle/cloud-in-a-bottle/services/installer"
+
 
 class Router:
     def __init__(self, bundle, apps=()):
@@ -473,6 +477,73 @@ async def test_existing_configuration_matches_canonical_export_despite_record_or
     assert (await session.activate())["ok"] is True
     assert len(router.mutations("/reload_app/" + "N" * 12)) == 1
     assert not router.installs()
+
+
+async def test_launch_error_is_retried_once_and_can_still_restore(mock_http):
+    """A launch verdict is not a recovery verdict.
+
+    The router judges one launch attempt with a fixed budget for the app's
+    first HTTP response, so a resource-capped app on a loaded host comes back
+    as an error while it is healthy. A single further reload starts it, which
+    is exactly what an operator would do by hand.
+    """
+    bundle = make_bundle("notes", runtime=True)
+    router = Router(bundle, [inventory_entry("notes", "N" * 12)])
+    attempts = []
+
+    def reload(request, body):
+        attempts.append(body)
+        # Fall through to the default handler, which re-seeds the worker states.
+        router.deploy_states["notes"] = ["error"] if len(attempts) == 1 else ["running"]
+        return None
+
+    router.hooks["/reload_app/" + "N" * 12] = reload
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    result = await session.activate()
+    assert result["ok"] is True
+    assert len(router.mutations("/reload_app/" + "N" * 12)) == 2
+    assert all(body == {"update": False} for body in attempts), "A retry must not widen grants or fetch other source"
+    restored = next(app for app in result["apps"] if app["name"] == "notes")
+    assert (restored["ok"], restored["outcome"], restored["launch_attempts"]) == (True, "restored", 2)
+    assert restored["warnings"] == []
+    assert not result["warnings"]
+
+
+async def test_persistent_launch_error_fails_after_exactly_one_retry(mock_http):
+    """The retry is bounded: a genuinely broken app still fails, without looping."""
+    bundle = make_bundle("notes", runtime=True)
+    router = Router(bundle, [inventory_entry("notes", "N" * 12)])
+    router.deploy_states["notes"] = ["error"]
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    result = await session.activate()
+    assert result["ok"] is False
+    assert result["phase"] == "incomplete"
+    assert len(router.mutations("/reload_app/" + "N" * 12)) == 2
+    failed = next(app for app in result["apps"] if app["name"] == "notes")
+    assert (failed["ok"], failed["outcome"], failed["launch_attempts"]) == (False, "failed", 2)
+    assert any("An app deployment failed" in warning for warning in failed["warnings"])
+
+
+async def test_app_still_converging_at_the_ceiling_is_pending_not_failed(mock_http):
+    """Running out of time while an app is still starting is not a failure."""
+    bundle = make_bundle("notes", runtime=True)
+    router = Router(bundle, [inventory_entry("notes", "N" * 12)])
+    router.deploy_states["notes"] = ["starting"] * 200
+    mock_http(router)
+    session = session_for(bundle, timeout=0.2)
+    await prepare(router, session)
+    result = await session.activate()
+    assert result["ok"] is False
+    assert result["phase"] == "incomplete"
+    assert len(router.mutations("/reload_app/" + "N" * 12)) == 1, "A converging app is not a launch failure to retry"
+    pending = next(app for app in result["apps"] if app["name"] == "notes")
+    assert (pending["ok"], pending["outcome"], pending["status"]) == (False, "pending", "starting")
+    assert any("still building or starting" in warning for warning in pending["warnings"])
+    assert not any("An app deployment failed" in warning for warning in pending["warnings"])
 
 
 @pytest.mark.parametrize("change", [
@@ -979,8 +1050,15 @@ async def test_rejected_install_never_adopts_concurrently_created_provider(mock_
     assert OWNER_TOKEN not in json.dumps(result)
 
 
-@pytest.mark.parametrize("states", [["building", "error"], ["building"], ["starting"], ["removing"]])
-async def test_accepted_install_does_not_count_as_complete_without_running(mock_http, states):
+@pytest.mark.parametrize("states,outcome,fragment", [
+    (["building", "error"], "failed", "An app deployment failed"),
+    # Still building or starting at the ceiling has not been shown to be broken,
+    # so it is pending rather than a failed deployment.
+    (["building"], "pending", "still building or starting"),
+    (["starting"], "pending", "still building or starting"),
+    (["removing"], "failed", "Destination apps changed"),
+])
+async def test_accepted_install_does_not_count_as_complete_without_running(mock_http, states, outcome, fragment):
     bundle = make_bundle("notes")
     router = Router(bundle)
     router.deploy_states["notes"] = states
@@ -989,7 +1067,8 @@ async def test_accepted_install_does_not_count_as_complete_without_running(mock_
     await prepare(router, session)
     result = await session.activate()
     assert result["ok"] is False and result["apps"][0]["ok"] is False
-    assert result["apps"][0]["outcome"] == "failed"
+    assert result["apps"][0]["outcome"] == outcome
+    assert any(fragment in warning for warning in result["apps"][0]["warnings"])
     assert OWNER_TOKEN not in json.dumps(result) and VERIFIER not in json.dumps(result)
 
 
@@ -1033,6 +1112,31 @@ async def test_destination_parse_supplies_builtin_path_verbatim(mock_http):
     await prepare(router, session)
     assert (await session.activate())["ok"] is True
     assert router.mutations("/api/add_app")[0][2]["repo_url"] == "file:///opt/router-bundle/apps/file_browser"
+
+
+async def test_grant_on_a_service_with_no_captured_default_does_not_block_the_app(mock_http):
+    """A grant with no default provider names no app to wait for.
+
+    The router records a global grant without requiring the service to be
+    registered, so an app holding a grant for a service nothing provides as
+    default must still launch. This is the default-platform-app shape seen live:
+    a grant on a service the destination router does not serve.
+    """
+    bundle = make_bundle("catalog", runtime=True)
+    add_global(bundle, "catalog", INSTALLER, {"key": "INSTALL"})
+    router = Router(bundle, [inventory_entry("catalog", "C" * 12)])
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    result = await session.activate()
+    assert result["ok"] is True, result
+    assert result["warnings"] == []
+    restored = next(a for a in result["apps"] if a["name"] == "catalog")
+    assert (restored["ok"], restored["outcome"]) == (True, "restored")
+    assert router.apps["catalog"]["status"] == "running"
+    assert len(router.mutations("/reload_app/" + "C" * 12)) == 1, "The app must actually be launched"
+    # The grant is still restored, even though no provider was ever mapped to it.
+    assert [g for g in router.permissions if g["consumer_app_id"] == "C" * 12 and g["service_url"] == INSTALLER]
 
 
 async def test_provider_failure_blocks_consumer_and_never_selects_other_data(mock_http):

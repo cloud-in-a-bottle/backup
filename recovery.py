@@ -76,6 +76,19 @@ _DEFAULT_FAILED = "A captured service-provider selection could not be restored."
 _CLEANUP_FAILED = "An unaffected app could not be restarted; check the paused-app journal."
 _FINAL_UNCONFIRMED = "The final recovery state could not be confirmed. Check the router before retrying."
 
+# Router app states that mean a launch is still in progress rather than
+# finished. The platform reports ``building`` while an image is being built and
+# ``starting`` while the container comes up; neither is a verdict on the app.
+_CONVERGING_STATUSES = frozenset({"building", "starting"})
+
+
+def _failure_outcome(code: str) -> str:
+    """Per-app outcome label for a recovery failure code.
+
+    Kept in one place so the activation and validation passes cannot disagree
+    about what a code means for the operator.
+    """
+    return {"install_unknown": "unknown", "deployment_pending": "pending"}.get(code, "failed")
 
 def _require_ok(response: object) -> None:
     if type(response) is not dict or response.get("ok") is not True:
@@ -125,7 +138,8 @@ class RecoverySession:
         self._completion_confirmed = False
         self._warnings = []
         self._apps = {name: {"name": name, "app_id": None, "plan_status": None, "action": None,
-                             "status": None, "outcome": "pending", "ok": False, "warnings": []} for name in self._selected}
+                             "status": None, "outcome": "pending", "ok": False, "launch_attempts": 0, "warnings": []}
+                      for name in self._selected}
         self._tokens = {"expected": len(self._definitions["platform_api_tokens"]), "added": 0, "existing": 0, "confirmed": False}
         if self._runtime is None:
             self._warn(_RUNTIME_MISSING)
@@ -465,6 +479,7 @@ class RecoverySession:
     async def _wait_running(self, name: str, app_id: str | None, *, unknown_install: bool = False) -> str:
         deadline = asyncio.get_running_loop().time() + self._deployment_timeout
         found = False
+        last_status = None
         try:
             while True:
                 inventory = _inventory(await self._get_before_deadline("/api/apps", deadline))
@@ -476,6 +491,7 @@ class RecoverySession:
                     app_id = app["app_id"]
                     if name in self._apps:
                         self._apps[name].update(app_id=app_id, status=app["status"])
+                    last_status = app["status"]
                     if app["status"] == "running":
                         return app_id
                     if app["status"] == "error":
@@ -486,6 +502,11 @@ class RecoverySession:
         except ConfigurationError as error:
             if unknown_install and not found and error.code == "deployment_timeout":
                 raise ConfigurationError("install_unknown") from None
+            # An app still building or starting when the ceiling expires has not
+            # failed, it has not finished. Say so, instead of reporting a failed
+            # deployment for a launch that may still succeed on its own.
+            if error.code == "deployment_timeout" and last_status in _CONVERGING_STATUSES:
+                raise ConfigurationError("deployment_pending") from None
             raise
 
     async def _restore_global_grants(self, name: str, app_id: str) -> None:
@@ -506,12 +527,41 @@ class RecoverySession:
             if key not in actual:
                 _require_ok(await self._client.post("/api/permissions/v2/grant_global_scoped", {"app_id": app_id, **grant}))
 
+    def _count_launch(self, name: str) -> None:
+        """Record one launch attempt for a selected app.
+
+        Unaffected paused apps are resumed through the same path but are not
+        part of the selected set, so they carry no per-app progress entry.
+        """
+        app = self._apps.get(name)
+        if app is not None:
+            app["launch_attempts"] += 1
+
     async def _reload(self, name: str, app_id: str) -> str:
+        self._count_launch(name)
         try:
             _require_ok(await self._client.post(f"/reload_app/{app_id}", {"update": False}))
         except ConfigurationError as error:
             # A timeout/invalid success can hide a running worker. Reconcile the
             # same identity; never retry reload or turn it into an add_app call.
+            if error.status_code is not None and 400 <= error.status_code < 500:
+                raise
+        try:
+            return await self._wait_running(name, app_id)
+        except ConfigurationError as error:
+            # The router judges one launch attempt with a fixed budget for the
+            # app's first HTTP response, so a resource-capped app on a loaded
+            # host can come back as an error while it is perfectly healthy. The
+            # platform treats that verdict as retryable, since an operator who
+            # reloads the app again gets a running container. Do the same here,
+            # exactly once, before recording a failure. Identity is still
+            # checked on every poll, so this cannot mask a replaced app.
+            if error.code != "deployment_failed":
+                raise
+        self._count_launch(name)
+        try:
+            _require_ok(await self._client.post(f"/reload_app/{app_id}", {"update": False}))
+        except ConfigurationError as error:
             if error.status_code is not None and 400 <= error.status_code < 500:
                 raise
         return await self._wait_running(name, app_id)
@@ -613,6 +663,14 @@ class RecoverySession:
         for service, provider in sorted(self._requirements[name], key=lambda pair: (pair[0], pair[1] or "")):
             if provider == name:
                 continue  # a provider can consume its own service after startup
+            if provider is None:
+                # No app was the captured default for this service, so there is
+                # no provider to wait for. The router records a global grant
+                # without requiring the service to be registered, so gating this
+                # app's launch on one would refuse to start a healthy app over a
+                # permission the destination can still hold. The grant itself is
+                # restored with the app's other global grants.
+                continue
             await self._provider_ready(service, provider)
             if self._runtime is not None and any(p["is_default"] and p["service_url"] == service and p["app_name"] == provider for p in self._provider_specs):
                 await self._set_default(service, provider)
@@ -634,6 +692,7 @@ class RecoverySession:
                 await self._reload(name, app_id)
             else:
                 result["action"] = "install"
+                result["launch_attempts"] += 1
                 app_id = await self._install(name)
             result.update(app_id=app_id, status="running", outcome="restored", ok=True)
             self._ready.add(name)
@@ -655,7 +714,10 @@ class RecoverySession:
                     result.update(ok=False, outcome="desired_state_unavailable")
         except ConfigurationError as error:
             self._ready.discard(name)
-            result.update(ok=False, outcome="unknown" if error.code == "install_unknown" else "failed")
+            # A launch that ran out of time while still converging is reported as
+            # pending, not failed: nothing about it has been shown to be broken,
+            # and it may still reach running on its own.
+            result.update(ok=False, outcome=_failure_outcome(error.code))
             self._warn(str(error), name)
 
     async def _apply_saved_stopped_states(self) -> None:
@@ -710,7 +772,7 @@ class RecoverySession:
             return
 
         def fail(name: str, code: str) -> None:
-            self._apps[name].update(ok=False, outcome="failed")
+            self._apps[name].update(ok=False, outcome=_failure_outcome(code))
             self._ready.discard(name)
             self._warn(str(ConfigurationError(code)), name)
 
@@ -725,7 +787,11 @@ class RecoverySession:
             result["status"] = app["status"]
             recorded_stopped = (self._runtime is not None and self._runtime["apps"][name]["status"] == "stopped")
             expected_state = "stopped" if recorded_stopped and states_final else "running"
-            if app["status"] != expected_state:
+            if app["status"] in _CONVERGING_STATUSES:
+                # Still building or starting: the launch is in progress, so this
+                # is a pending outcome, not a failed deployment.
+                fail(name, "deployment_pending")
+            elif app["status"] != expected_state:
                 fail(name, "deployment_failed")
             if self._runtime is not None:
                 desired = {_record_key(g) for g in self._runtime["apps"][name]["global_grants"]}
