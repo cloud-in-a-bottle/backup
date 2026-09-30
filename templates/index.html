@@ -392,7 +392,7 @@
         <section>
             <h2>Migrate apps to another instance</h2>
             <p class="info">
-                Move persistent app data, private definitions, API-key records, global service grants and provider selections to another instance. Upgrade both backup apps to protocol v4 and provide owner API tokens for both instances.
+                Move persistent app data, private definitions, API-key records, global service grants and provider selections to another instance. Upgrade both backup apps to protocol v5 and provide owner API tokens for both instances.
             </p>
             <button class="btn-secondary" onclick="showTokenSetup()">Set up local Router API Token</button>
             <details style="margin-bottom:12px;">
@@ -400,7 +400,7 @@
                 <div class="info" style="background:#fef3c7;padding:10px;border-radius:4px;color:#92400e;margin-top:6px;">
                     <strong>This instance:</strong> The backend validates the target and captures configuration and desired states before pausing all non-backup apps that may write shared data, including unselected apps. Selected apps remain stopped after cutover; previously running unselected apps resume during cleanup. Source app data is not modified or deleted.
                     <br><br>
-                    <strong>Destination:</strong> All bounded chunks are staged and checksummed before apps are stopped and selected data trees are replaced. Keys are imported additively and providers/grants are restored before consumers. Recovery waits for readiness.
+                    <strong>Destination:</strong> The encrypted snapshot is transferred and verified before apps are stopped. The ordinary backup restore then replaces selected data, imports keys, restores providers and grants, and waits for app readiness.
                     Other apps retain data and are restarted afterward.
                     <br><br>
                     <strong>Limits:</strong> Owner password, sessions and platform settings are not transferred. Provider-scoped OAuth approvals require manual reauthorization and make recovery incomplete. Existing app sources and published ports must match. Both existing and newly installed apps start during recovery before saved stopped states are applied; they can run while other apps become ready.
@@ -1756,13 +1756,13 @@
             msg.className = msg.textContent ? 'msg ' + (res.running ? 'msg-pending' : complete ? 'msg-ok' : 'msg-err') : '';
             if (!res.running && !complete) {
                 const safeErrors = [
-                    'Migration requires protocol v4. Upgrade both backup apps.',
+                    'Migration requires protocol v5. Upgrade both backup apps.',
                     'Destination owner authentication failed.',
                     'Another operation is active.',
                     'A selected app conflicts with the destination backup executor. Change the selection or executor name.',
                     'Migration requires owner inspection and acknowledgment before retrying.',
                     'Invalid or incomplete migration transfer sequence.',
-                    'App data transfer or archive verification failed.',
+                    'Snapshot transfer or verification failed.',
                     'Migration deadline exceeded.',
                 ];
                 if (safeErrors.includes(status.error)) {

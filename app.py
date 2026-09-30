@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 logger.info("backup app module loaded")
 
 app = Quart(__name__)
-# Protocol v4 uses bounded chunks below the platform's 16 MiB proxy limit.
+# Encrypted repository uploads stay below the platform's 16 MiB proxy limit.
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ def _receiver() -> migration.MigrationReceiver:
         _migration_receiver = migration.MigrationReceiver(
             lock=op_lock, all_app_data=ALL_APP_DATA,
             work_dir=APP_DATA_DIR / ".migration", router_url=ROUTER_URL,
-            backup_app_name=APP_NAME,
+            backup_app_name=APP_NAME, restore=_restore_migration_snapshot,
         )
     return _migration_receiver
 
@@ -2003,7 +2003,7 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
                 # Every promoted byte must reach stable storage before the
                 # journal may claim this recovery is complete.
                 try:
-                    await drain(asyncio.to_thread(migration.durability_barrier))
+                    await drain(asyncio.to_thread(migration_data.durability_barrier, *(stages or [APP_DATA_DIR])))
                 except Exception:
                     logger.error("Recovery durability barrier failed", exc_info=True)
                     cleanup_failed = True
@@ -2038,7 +2038,7 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
                     try:
                         rollback = rollbacks.get(data_root)
                         if rollback is not None:
-                            await migration.discard_app_trees(rollback)
+                            await migration_data.discard_app_trees(rollback)
                         await asyncio.to_thread(shutil.rmtree, stage)
                     except Exception:
                         logger.warning("Retaining staged originals after committed recovery", exc_info=True)
@@ -2126,7 +2126,7 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
             payload = stage / str(data_root).lstrip("/")
             # Keep the rollback token for every promoted root until the whole
             # recovery is durably committed; a later root can still fail.
-            rollbacks[data_root] = await migration.replace_app_trees(
+            rollbacks[data_root] = await migration_data.replace_app_trees(
                 payload, data_root, session.restore_app_names
             )
         data_promoted = True
@@ -3162,6 +3162,8 @@ async def chown_app_data():
 async def migration_status_endpoint():
     idle = op_lock.idle_seconds() if op_lock.migration_running else None
     incoming = _receiver().journal_status
+    if incoming and incoming.get("snapshot") == (restore_progress or {}).get("snapshot") and incoming.get("snapshot"):
+        incoming["recovery"] = _restore_session.progress if _restore_session else restore_progress.get("recovery")
     displayed = migration.status
     if incoming and (displayed is None or incoming.get("phase") in {"preflighting", "receiving", "finalizing"}):
         phase = incoming.get("phase", "interrupted")
@@ -3276,26 +3278,20 @@ async def receive_app(app_name):
     raise migration.MigrationError("protocol")
 
 
-@route("/api/migration/receive/chunk/<session_id>/<app_name>", methods=["POST"])
-async def receive_chunk(session_id, app_name):
+@route("/api/migration/receive/object/<session_id>/<kind>/<identifier>", methods=["POST"])
+async def receive_object(session_id, kind, identifier):
     token = _receive_owner_token()
-    index = request.headers.get("X-Chunk-Index", "")
-    size = request.headers.get("X-Archive-Bytes", "")
-    final = request.headers.get("X-Chunk-Final", "")
-    digest = request.headers.get("X-Archive-SHA256", "")
-    if (
-        not re.fullmatch(r"[0-9]{1,12}", index) or not re.fullmatch(r"[0-9]{1,18}", size)
-        or final not in {"0", "1"} or not re.fullmatch(r"[0-9a-f]{64}", digest)
-    ):
+    offset = request.headers.get("X-Object-Offset", "")
+    if not re.fullmatch(r"[0-9]{1,13}", offset):
         raise migration.MigrationError("invalid")
     return jsonify(await _receiver().upload(
-        session_id, app_name, request.body, index=int(index), final=final == "1",
-        archive_bytes=int(size), archive_sha256=digest, owner_token=token,
+        session_id, kind, identifier, request.body, offset=int(offset), owner_token=token,
     ))
 
 
 @route("/api/migration/receive/chunk/<app_name>", methods=["POST"])
-async def receive_legacy_chunk(app_name):
+@route("/api/migration/receive/chunk/<session_id>/<app_name>", methods=["POST"])
+async def receive_legacy_chunk(app_name, session_id=None):
     raise migration.MigrationError("protocol")
 
 
@@ -3308,6 +3304,13 @@ async def receive_data():
 async def receive_finalize():
     token = _receive_owner_token()
     return jsonify(await _receiver().finalize(await _migration_json(), owner_token=token))
+
+
+async def _restore_migration_snapshot(snapshot, repository, password, owner_token):
+    """Incoming migration uses the ordinary restore transaction and journal."""
+    conf = {"repo": str(repository), "repo_password": password, "env": {}}
+    ok = await _restore_configuration_snapshot(snapshot, conf, owner_token)
+    return {"ok": ok, "recovery": (restore_progress or {}).get("recovery")}
 
 
 def _receive_owner_token() -> str:
@@ -3366,6 +3369,13 @@ async def migration_acknowledge():
     token = await _caller_is_owner()
     if not token:
         return _owner_required_response()
+    incoming = _receiver().journal_status or {}
+    if incoming.get("snapshot") and incoming["snapshot"] == (restore_progress or {}).get("snapshot"):
+        # One owner acknowledgment covers this migration's ordinary restore
+        # journal too; an unrelated restore notice is never cleared here.
+        response = await app.make_response(await acknowledge_restore())
+        if response.status_code != 200:
+            return response
     state = await _receiver().acknowledge(owner_token=token)
     return jsonify(state if type(state) is dict else {"ok": True, "needs_attention": False})
 

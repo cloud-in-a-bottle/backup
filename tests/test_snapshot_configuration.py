@@ -291,7 +291,7 @@ async def test_data_promotion_failure_never_activates_and_retry_notice_survives(
         return result
 
     monkeypatch.setattr(backup_app, "RecoverySession", make_session)
-    monkeypatch.setattr(backup_app.migration, "replace_app_trees", AsyncMock(side_effect=OSError("private-failure-marker")))
+    monkeypatch.setattr(backup_app.migration_data, "replace_app_trees", AsyncMock(side_effect=OSError("private-failure-marker")))
     assert not await backup_app.run_restore(saved["id"], owner_token=OWNER_CREDENTIAL)
     assert sessions[0].events == ["preflight", "stop", "cleanup"]
     assert backup_app._restore_needs_attention

@@ -142,7 +142,7 @@ def test_journal_rename_is_durable_or_fatal(environment, monkeypatch):
     # a later restart cannot read a cleared gate that the caller still reports
     # as a persistence failure.
     assert json.loads(path.read_text()) == original
-    assert not list(path.parent.glob(".journal-previous-*"))
+    assert not list(path.parent.glob("journal-rollback-*"))
 
 
 async def test_journal_persistence_failure_precedes_recovery_actions(environment, monkeypatch):
@@ -214,7 +214,7 @@ async def test_staging_references_exist_before_promotion(environment, monkeypatc
         (staged / ".migration-old-originals" / "precious.txt").write_text("original data")
         raise OSError("promotion and rollback failed")
 
-    monkeypatch.setattr(backup_app.migration, "replace_app_trees", fail)
+    monkeypatch.setattr(backup_app.migration_data, "replace_app_trees", fail)
     assert not await backup_app.run_restore(snapshot["id"], owner_token=OWNER_CREDENTIAL)
     saved = json.loads(backup_app._restore_journal_path().read_text())
     stage = backup_app.ALL_APP_DATA / backup_app.RESTORE_WORK_NAME / saved["job_id"]
@@ -280,15 +280,19 @@ async def test_committed_recovery_barriers_then_discards_originals(environment, 
     monkeypatch.setattr(backup_app, "RecoverySession", Session)
     order = []
 
-    def barrier():
-        order.append(("barrier", json.loads(backup_app._restore_journal_path().read_text())["phase"]))
+    real_barrier = backup_app.migration_data.durability_barrier
+    def barrier(*roots):
+        phase = json.loads(backup_app._restore_journal_path().read_text())["phase"]
+        if phase == "activating":
+            order.append(("barrier", phase))
+        real_barrier(*roots)
 
     async def discard(rollback):
         order.append(("discard", Path(rollback).is_dir()))
         await asyncio.to_thread(shutil.rmtree, rollback)
 
-    monkeypatch.setattr(backup_app.migration, "durability_barrier", barrier)
-    monkeypatch.setattr(backup_app.migration, "discard_app_trees", discard)
+    monkeypatch.setattr(backup_app.migration_data, "durability_barrier", barrier)
+    monkeypatch.setattr(backup_app.migration_data, "discard_app_trees", discard)
     assert await _restore(backup_app, snapshot)
     assert restore_last_snapshot_of(backup_app) == snapshot["id"]
     roots = {name for name, path in backup_app._ROOT_NAMES.items() if str(path) in snapshot["paths"]}
@@ -312,8 +316,13 @@ async def test_failed_durability_barrier_keeps_originals_and_attention(environme
     snapshot = await newest_snapshot()
     monkeypatch.setattr(backup_app, "RecoverySession", Session)
     disposed = []
-    monkeypatch.setattr(backup_app.migration, "durability_barrier", lambda: (_ for _ in ()).throw(OSError("synthetic")))
-    monkeypatch.setattr(backup_app.migration, "discard_app_trees", lambda rollback: disposed.append(rollback))
+    real_barrier = backup_app.migration_data.durability_barrier
+    def fail_completion(*roots):
+        if backup_app.restore_progress["phase"] == "activating":
+            raise OSError("synthetic")
+        real_barrier(*roots)
+    monkeypatch.setattr(backup_app.migration_data, "durability_barrier", fail_completion)
+    monkeypatch.setattr(backup_app.migration_data, "discard_app_trees", lambda rollback: disposed.append(rollback))
     assert not await _restore(backup_app, snapshot)
     assert not disposed
     assert backup_app._restore_needs_attention
@@ -384,7 +393,7 @@ async def test_failed_complete_journal_keeps_originals(environment, monkeypatch)
 
     disposed = []
     monkeypatch.setattr(backup_app, "_checkpoint_restore", checkpoint)
-    monkeypatch.setattr(backup_app.migration, "discard_app_trees", lambda rollback: disposed.append(rollback))
+    monkeypatch.setattr(backup_app.migration_data, "discard_app_trees", lambda rollback: disposed.append(rollback))
     assert not await _restore(backup_app, snapshot)
     # The commit was attempted, then the final durable record demands attention.
     assert phases[-2:] == ["complete", "incomplete"]
@@ -407,7 +416,7 @@ async def test_post_commit_disposal_failure_keeps_retained_reference(environment
     async def fail_discard(rollback):
         raise OSError("synthetic post-commit disposal failure")
 
-    monkeypatch.setattr(backup_app.migration, "discard_app_trees", fail_discard)
+    monkeypatch.setattr(backup_app.migration_data, "discard_app_trees", fail_discard)
     # Disposal is garbage collection after a durable commit, so the recovery
     # stays successful and the stage stays for manual inspection.
     assert await _restore(backup_app, snapshot)

@@ -126,13 +126,13 @@ The "Run restic check" button runs `restic check`, which verifies the internal c
 
 ## Migration
 
-The Migrate tab moves selected apps, persistent data, private definitions, API-key records, desired states, exact global service grants and provider selections to another instance. Both backup apps must be upgraded to protocol v4. Older v3 receivers are rejected before side effects.
+The Migrate tab moves selected apps, persistent data, private definitions, API-key records, desired states, exact global service grants and provider selections to another instance. Both backup apps must be upgraded to protocol v5. Older receivers are rejected before side effects.
 
 ### How migration works
 
 1. The browser submits only `POST /api/migration/push`. The backend preflights destination protocol and owner authentication and captures configuration and desired states before pausing all non-backup source apps that may write shared data, including unselected apps.
-2. Each app's persistent data is compressed and transferred in bounded chunks of at most 14 MiB. The destination stages and checksums all chunks and validates archives before stopping destination apps or replacing selected data trees.
-3. The destination imports key records additively, restores provider selections and global grants, activates apps and waits for readiness. Existing source/port conflicts fail preflight. Provider-scoped approvals need manual reauthorization.
+2. Restic captures the selected persistent data and private configuration in a temporary encrypted repository. Its objects are sent directly to the destination in requests of at most 14 MiB; interrupted requests can be replayed. No shared storage account is needed.
+3. The destination runs a full restic integrity check, confirms the captured configuration, and uses the same staged restore transaction as a backup restore. That transaction imports key records additively, restores provider selections and global grants, activates apps and waits for readiness. Existing source/port conflicts fail preflight. Provider-scoped approvals need manual reauthorization.
 4. Unaffected apps resume together, then saved running/stopped states are applied, and every paused app is rechecked at the final boundary. Both existing and newly installed selected apps start before saved stopped states can be applied and can run while other apps become ready. The source reports success only after confirmed destination recovery and unaffected-source cleanup.
 5. Selected source apps remain stopped after cutover. Inspect incomplete results before retrying. Owner passwords, sessions and platform settings are not transferred.
 
@@ -142,9 +142,9 @@ An interrupted outgoing migration is recorded on the source. Backups and new mig
 
 - A local owner Router API Token, configured in the Backups tab, and the approved Private definitions export grant.
 - A destination owner API token, entered in the Migrate tab.
-- Both backup apps installed, running and upgraded to protocol v4.
+- Both backup apps installed, running and upgraded to protocol v5.
 
-Migration pauses non-backup source writers, including unselected running apps, before copying persistent data. Previously running unselected apps normally resume during source cleanup after destination recovery. It does not transfer temporary or archive storage. Ordinary restic backups still read live files and are not a universal application-consistent snapshot. Archive traversal, unsafe links and unsupported archive entries are rejected during staging; there is no browser-side stop or blanket ownership-fix step.
+Migration pauses non-backup source writers, including unselected running apps, before copying persistent data. Previously running unselected apps normally resume during source cleanup after destination recovery. It does not transfer temporary or archive storage. Ordinary restic backups still read live files and are not a universal application-consistent snapshot. Restic handles file integrity and metadata preservation for both workflows; there is no browser-side stop or blanket ownership-fix step. Each instance needs temporary disk space for the encrypted repository, and the destination also needs restore staging space.
 
 ## Configuration
 
@@ -205,9 +205,9 @@ All routes are registered at both `/path` and `/backup/path` to handle the Cloud
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/migration/receive/capabilities` | Authenticate owner and report protocol v4 and chunk limit |
+| GET | `/api/migration/receive/capabilities` | Authenticate owner and report protocol v5 and request limit |
 | POST | `/api/migration/receive/start` | Preflight private bundle and reserve a receive session without stopping apps |
-| POST | `/api/migration/receive/chunk/<session_id>/<app_name>` | Stage a bounded chunk with index, final flag, byte count and SHA-256 headers |
+| POST | `/api/migration/receive/object/<session_id>/<kind>/<identifier>` | Upload an encrypted repository object range with an `X-Object-Offset` header |
 | POST | `/api/migration/receive/finalize` | Start or reconcile retained activation job after verified data transfer |
 | GET | `/api/migration/receive/status/<session_id>` | Poll receiver; only terminal `result.ok=true` confirms success |
 | POST | `/api/migration/receive/keepalive` | Keep an active receiving session alive while compressing source data |
@@ -219,8 +219,9 @@ All routes are registered at both `/path` and `/backup/path` to handle the Cloud
 |------|-------------|
 | `app.py` | Quart web application: routes, restic wrappers, scheduler, config management |
 | `operations.py` | Mutual-exclusion lock ensuring only one backup, restore, migration, or prune runs at a time |
-| `migration.py` | Cross-instance migration logic: bounded chunked push/receive protocol, durable source and receiver journals, paused-app reconciliation and retention |
-| `migration_data.py` | Validated archive staging and selected whole-tree replacement |
+| `migration.py` | Direct encrypted-snapshot transfer and source cutover; destination recovery uses the ordinary restore path |
+| `migration_data.py` | Shared whole-tree promotion, retained originals, and private work directories |
+| `journal.py` | Atomic durable progress publication shared by restore and migration |
 | `configuration.py` | Canonical private definition export, validation and supplemental runtime capture |
 | `recovery.py` | Owner-authorized preflight, provider/grant recovery and confirmed activation |
 | `snapshot_configuration.py` | Private restic bundle and credential-free recovery journal helpers |
@@ -276,4 +277,4 @@ restic version
 uv run --frozen --group dev pytest tests/ -v
 ```
 
-On a host with locally supplied Chromium libraries, load that environment and use `playwright install chromium` without `--with-deps`. Browser tests run an isolated local Quart/Hypercorn server with Chromium route mocks for expensive backend actions. They check recovery scopes, acceptance versus completion, incomplete notices and retries, private-field suppression, v4 push-only migration, keyboard/mobile operation and axe accessibility. They fail rather than skip when Chromium or axe is missing. CI installs the pinned restic and browser versions and runs the complete suite, including real-restic tests.
+On a host with locally supplied Chromium libraries, load that environment and use `playwright install chromium` without `--with-deps`. Browser tests run an isolated local Quart/Hypercorn server with Chromium route mocks for expensive backend actions. They check recovery scopes, acceptance versus completion, incomplete notices and retries, private-field suppression, push-only migration, keyboard/mobile operation and axe accessibility. They fail rather than skip when Chromium or axe is missing. CI installs the pinned restic and browser versions and runs the complete suite, including real-restic transfer and restore tests.

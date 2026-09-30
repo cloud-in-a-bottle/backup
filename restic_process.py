@@ -9,6 +9,34 @@ import signal
 from operations import drain
 
 
+class ReadError(ValueError):
+    """Fixed error codes; subprocess output never enters an exception."""
+    pass
+
+
+async def read(args, env, *, limit, timeout):
+    """Read bounded stdout, suppress stderr, and settle the process on every exit."""
+    proc = await asyncio.create_subprocess_exec(
+        "restic", *args, env=env, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        async with asyncio.timeout(timeout):
+            output = bytearray()
+            while chunk := await proc.stdout.read(65536):
+                if len(output) + len(chunk) > limit:
+                    raise ReadError("size")
+                output.extend(chunk)
+            if await proc.wait() != 0:
+                raise ReadError("exit")
+            return bytes(output)
+    except TimeoutError:
+        raise ReadError("timeout") from None
+    finally:
+        if proc.returncode is None or not proc.stdout.at_eof():
+            await kill_and_drain(proc)
+
+
 def kill_group(proc: asyncio.subprocess.Process) -> None:
     # Every caller starts a new session. Backend helpers (SSH/rclone) must not
     # retain inherited pipe descriptors or keep writing after restic is killed.

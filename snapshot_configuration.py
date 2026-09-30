@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
-import secrets
 import stat
 import tempfile
 from contextlib import contextmanager
@@ -14,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from configuration import MAX_CONFIGURATION_BYTES, parse_configuration, serialize_configuration
-from restic_process import kill_and_drain
+from journal import save_journal as _save_journal
+import restic_process
 
 CONFIGURATION_TAG = "bottle-configuration-v1"
 RUNTIME_TAG = "bottle-runtime-v1"
@@ -132,64 +131,23 @@ async def read_configuration(snapshot_id: str, env: dict, *, timeout: float = 60
     """Read a bounded metadata blob without logging/decrypting it to a public path."""
     if not _FULL_SNAPSHOT_ID.fullmatch(snapshot_id):
         raise SnapshotConfigurationError("Invalid snapshot identifier.")
-    proc = await asyncio.create_subprocess_exec(
-        "restic", "dump", snapshot_id, str(CONFIGURATION_FILE), "--no-lock",
-        env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=True,
-    )
     try:
-        async with asyncio.timeout(timeout):
-            output = bytearray()
-            assert proc.stdout is not None
-            while chunk := await proc.stdout.read(65536):
-                if len(output) + len(chunk) > MAX_CONFIGURATION_BYTES:
-                    raise SnapshotConfigurationError("The snapshot configuration exceeds the supported size limit.")
-                output.extend(chunk)
-            await proc.wait()
-            if proc.returncode != 0:
-                raise SnapshotConfigurationError("Could not read private configuration from this snapshot.")
-            return parse_configuration(bytes(output))
-    except TimeoutError:
-        raise SnapshotConfigurationError("Reading the snapshot configuration timed out.") from None
-    finally:
-        if proc.returncode is None or (proc.stdout is not None and not proc.stdout.at_eof()):
-            await kill_and_drain(proc)
+        output = await restic_process.read(
+            ["dump", snapshot_id, str(CONFIGURATION_FILE), "--no-lock"], env,
+            limit=MAX_CONFIGURATION_BYTES, timeout=timeout,
+        )
+        return parse_configuration(output)
+    except restic_process.ReadError as error:
+        message = {"size": "The snapshot configuration exceeds the supported size limit.",
+                   "timeout": "Reading the snapshot configuration timed out.",
+                   "exit": "Could not read private configuration from this snapshot."}[str(error)]
+        raise SnapshotConfigurationError(message) from None
 
 
 def save_journal(path: Path, state: dict) -> None:
-    """Persist only caller-supplied safe progress, never a private bundle or token.
-
-    A durable publication is all-or-nothing: if the replacement cannot be made
-    durable, the previous journal is restored so a later restart never reads a
-    cleared attention gate that the caller still reports as a failure.
-    """
+    """Create restore's private directory, then use the common journal writer."""
     _private_directory(path.parent)
-    descriptor, temporary = tempfile.mkstemp(prefix=".journal-", dir=path.parent)
-    previous = None
     try:
-        # fdopen takes ownership of the descriptor; if it cannot, the cleanup
-        # below removes the file and the descriptor must be closed here.
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            descriptor = None
-            json.dump(state, stream, ensure_ascii=False, allow_nan=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        if path.exists() and not path.is_symlink():
-            previous = path.parent / f".journal-previous-{secrets.token_hex(16)}"
-            os.link(path, previous)
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    except BaseException:
-        if previous is not None:
-            try:
-                os.replace(previous, path)
-                _fsync_directory(path.parent)
-            except OSError:
-                pass
-        raise
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        Path(temporary).unlink(missing_ok=True)
-        if previous is not None:
-            Path(previous).unlink(missing_ok=True)
+        _save_journal(path, state)
+    except OSError:
+        raise SnapshotConfigurationError("Could not durably persist recovery progress.") from None

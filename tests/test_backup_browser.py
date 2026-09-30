@@ -425,7 +425,7 @@ async def test_live_receiver_details_and_incomplete_incoming_after_outgoing_succ
 async def test_migration_cleanup_and_preflight_failure_guidance(browser_ui):
     page, api = browser_ui
     await prepare_migration(page)
-    api.migration.update(running=False, status={"phase": "failed", "error": "Migration requires protocol v4. Upgrade both backup apps."})
+    api.migration.update(running=False, status={"phase": "failed", "error": "Migration requires protocol v5. Upgrade both backup apps."})
     await expect(page.locator("#mig-details")).to_contain_text("Upgrade both backup apps")
     api.migration["status"] = {
         "phase": "failed", "error": PRIVATE,
