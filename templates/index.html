@@ -90,6 +90,7 @@
         .page.active { display: block; }
         :focus-visible { outline: 3px solid #2563eb; outline-offset: 3px; }
         .table-scroll { overflow-x: auto; }
+        #snapshots-container th, #snapshots-body .browse-link, #snapshots-body td:last-child { white-space: nowrap; }
         .recovery-details { font-size: 0.85rem; line-height: 1.6; overflow-wrap: anywhere; }
         .recovery-details ul { padding-left: 20px; }
         .browse-link { background: transparent; padding: 2px; font: inherit; }
@@ -220,7 +221,7 @@
         <!-- Snapshots -->
         <section>
             <h2>Snapshots</h2>
-            <p class="info">Select a snapshot to browse files, restore, or delete. Legacy snapshots recover files only; they cannot recreate missing app definitions or API keys.</p>
+            <p class="info">Select a snapshot to browse files, restore, or delete.</p>
             <div class="btn-row" style="margin-bottom: 12px;">
                 <button class="btn-secondary" id="btn-load-snapshots" onclick="loadSnapshots()">Refresh snapshots</button>
             </div>
@@ -232,8 +233,7 @@
                             <th style="padding:6px 8px;">ID</th>
                             <th style="padding:6px 8px;">Name</th>
                              <th style="padding:6px 8px;">Source</th>
-                             <th style="padding:6px 8px;">Recovery scope</th>
-                            <th style="padding:6px 8px;text-align:right;" title="Logical size of the files in this snapshot (before dedup/compression)">Snapshot size (uncompressed)</th>
+                            <th style="padding:6px 8px;text-align:right;" title="Logical size of the files in this snapshot (before dedup/compression)">Size</th>
                         </tr>
                     </thead>
                     <tbody id="snapshots-body"></tbody>
@@ -248,7 +248,10 @@
                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
                     <span style="font-family:monospace;font-size:0.9rem;font-weight:600;" id="selected-snapshot-label"></span>
                 </div>
-                <p class="info" id="selected-snapshot-scope"></p>
+                <details style="margin-bottom:12px;font-size:0.85rem;">
+                    <summary id="selected-snapshot-contents" style="cursor:pointer;">Snapshot contents</summary>
+                    <p class="info" id="selected-snapshot-scope" style="margin-top:8px;"></p>
+                </details>
                 <div class="btn-row">
                     <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot(null, '')">Browse</button>
                     <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
@@ -269,10 +272,12 @@
                 </table>
             </div>
             <div id="restore-state" role="status" aria-live="polite" style="margin-top:12px;"></div>
-            <div id="restore-details" class="recovery-details"></div>
+            <details id="restore-report" class="scope-block" hidden>
+                <summary>Restore details</summary>
+                <div id="restore-details" class="recovery-details"></div>
+            </details>
             <div id="restore-attention" hidden>
-                <p class="info">Inspect affected apps, retained original data and pending restarts before retrying this snapshot. Reconcile source or published-port conflicts, or use a fresh destination. Provider-scoped approvals require manual reauthorization.</p>
-                <p class="info">Acknowledging only clears the notice. It does not start apps or delete retained original data.</p>
+                <p class="info">Review the restore details before retrying. Acknowledging clears this notice without changing apps or retained data.</p>
                 <button class="btn-secondary" id="btn-acknowledge" onclick="acknowledgeRestore()">Acknowledge after inspection</button>
             </div>
             <div id="manage-msg" role="status"></div>
@@ -368,10 +373,8 @@
                 </span>
             </div>
             <p class="info" id="router-token-desc" style="{% if not config.get('router_api_token') %}color:#92400e;{% endif %}">
-                Optional for basic definition and API-key backups. Configure a local owner token to also capture desired app states, exact global service grants and provider selections. Full configuration restore and migration require owner authority.
-                Generate a token in dashboard settings under <strong>API Tokens</strong>. An invalid configured token fails the backup.
+                Use an owner API token from dashboard <strong>Settings</strong> to back up permissions and app states, or to restore and migrate apps.
             </p>
-            <p class="info">Every new backup requires the owner-approved global <strong>Private</strong> grant for <code>github.com/cloud-in-a-bottle/cloud-in-a-bottle/services/app-definitions</code>. On older installations, use native <strong>Update &amp; Reload</strong> and approve the request. Missing or failed export fails the backup.</p>
             <label for="router-token-input">Router API Token</label>
             <div style="display:flex;gap:8px;margin-bottom:8px;">
                 <input type="password" id="router-token-input" placeholder="{% if config.get('router_api_token') %}Configured; enter a new token to update. {% else %}Paste your API token here{% endif %}" autocomplete="off" style="margin-bottom:0;">
@@ -392,7 +395,7 @@
         <section>
             <h2>Migrate apps to another instance</h2>
             <p class="info">
-                Move persistent app data, private definitions, API-key records, global service grants and provider selections to another instance. Upgrade both backup apps to protocol v5 and provide owner API tokens for both instances.
+                Move apps and their data to another instance. Both instances need Backup installed and an owner API token.
             </p>
             <button class="btn-secondary" onclick="showTokenSetup()">Set up local Router API Token</button>
             <details style="margin-bottom:12px;">
@@ -449,7 +452,10 @@
                 <div id="mig-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.78rem;color:#555;white-space:pre-wrap;"></div>
             </div>
 
-            <div id="mig-details" class="recovery-details"></div>
+            <details id="mig-report" class="scope-block" hidden>
+                <summary>Migration details</summary>
+                <div id="mig-details" class="recovery-details"></div>
+            </details>
             <div id="mig-state" role="status"></div>
             <div id="mig-msg" role="status"></div>
         </section>
@@ -1111,7 +1117,6 @@
                     '<td style="padding:6px 8px;font-family:monospace;"><button class="browse-link" aria-label="Select snapshot ' + escapeHtml(s.short_id) + '">' + escapeHtml(s.short_id) + '</button></td>' +
                     '<td style="padding:6px 8px;">' + nameHtml + '</td>' +
                     '<td style="padding:6px 8px;overflow-wrap:anywhere;">' + escapeHtml(source) + '</td>' +
-                    '<td style="padding:6px 8px;"><span class="status-badge ' + (s.has_configuration && s.has_runtime ? 'status-success' : 'status-warning') + '">' + snapshotScope(s).label + '</span></td>' +
                     '<td style="padding:6px 8px;text-align:right;font-size:0.8rem;color:#555;">' + escapeHtml(sizeText) + '</td>';
                 body.appendChild(tr);
             });
@@ -1166,7 +1171,9 @@
             document.getElementById("selected-snapshot-label").textContent = shortId + "  (" + id.substring(0, 16) + "…)";
             document.getElementById("browse-container").style.display = "none";
             document.getElementById("action-panel").style.display = "block";
-            document.getElementById("selected-snapshot-scope").textContent = snapshotScope(snapshotsAll.find(s => s.id === id)).description;
+            const scope = snapshotScope(snapshotsAll.find(s => s.id === id));
+            document.getElementById("selected-snapshot-contents").textContent = scope.label;
+            document.getElementById("selected-snapshot-scope").textContent = scope.description;
             updateRestoreButtons();
             const rows = document.getElementById("snapshots-body").querySelectorAll("tr");
             rows.forEach(tr => {
@@ -1334,15 +1341,15 @@
 
         function snapshotScope(snapshot) {
             if (!snapshot || snapshot.has_configuration !== true) return {
-                label: 'Legacy: files only',
-                description: 'File-only recovery. Cannot recreate missing app definitions or API keys; running apps are not coordinated. Reload apps manually as needed.'
+                label: 'Files only',
+                description: 'App definitions, API keys and app states are not included.'
             };
             return snapshot.has_runtime === true ? {
-                label: 'Configuration + runtime',
-                description: 'App data, definitions, API-key records, desired states, global grants and provider selections. Owner authority required. Provider-scoped approvals need manual reauthorization.'
+                label: 'Files and settings',
+                description: 'Files, app definitions, API keys, permissions, providers and app states. Provider-specific permissions may need reapproval.'
             } : {
-                label: 'Configuration: limited runtime',
-                description: 'App data, definitions and API-key records. Desired states, global grants and provider selections were not captured. Owner authority required; configure permissions and states manually.'
+                label: 'Files and app definitions',
+                description: 'Files, app definitions and API keys. Permissions, providers and app states were not captured.'
             };
         }
 
@@ -1500,7 +1507,7 @@
             const limited = complete && recovery && recovery.runtime_captured === false;
             el.textContent = res.running ? 'Restore running. Completion is not yet confirmed.' :
                 p.phase === 'acknowledged' ? 'Recovery notice acknowledged. This does not confirm recovery.' :
-                complete ? (limited ? 'Captured configuration restored with limited runtime scope.' : p.phase === 'files_only' ? 'File-only restore complete. App configuration was not restored.' : 'Restore complete: captured recovery scope verified.') :
+                complete ? (limited ? 'Restore complete (limited settings).' : p.phase === 'files_only' ? 'File-only restore complete.' : 'Restore complete.') :
                 res.needs_attention || res.last_status ? 'Recovery incomplete or failed. Inspect results before retrying.' : '';
             el.className = el.textContent ? 'msg ' + (res.running || p.phase === 'acknowledged' ? 'msg-pending' : limited ? 'msg-warning' : complete ? 'msg-ok' : 'msg-err') : '';
             recoveryDetails(document.getElementById('restore-details'), p);
@@ -1527,6 +1534,7 @@
                 document.getElementById('restore-details').appendChild(note);
             }
             document.getElementById('restore-attention').hidden = !(res.needs_attention === true && !res.running);
+            document.getElementById('restore-report').hidden = !document.getElementById('restore-details').hasChildNodes();
             updateRestoreButtons();
         }
 
@@ -1670,7 +1678,8 @@
             progressEl.style.display = phase || res.running ? 'block' : 'none';
             const incoming = res.receive;
             const incomingIncomplete = incoming && (incoming.phase !== 'complete' || incoming.result?.ok !== true || incoming.needs_attention === true);
-            const complete = !res.running && phase === 'done' && !incomingIncomplete;
+            const needsAttention = incomingIncomplete || res.source_recovery?.needs_attention === true;
+            const complete = !res.running && phase === 'done' && !needsAttention;
             const badge = document.getElementById('mig-phase');
             badge.textContent = phase || 'starting';
             badge.className = 'status-badge ' + (res.running ? 'status-running' : complete ? 'status-success' : 'status-error');
@@ -1752,7 +1761,7 @@
             const msg = document.getElementById('mig-state');
             msg.textContent = res.running ? 'Migration running. Completion is not yet confirmed.' :
                 complete ? 'Migration complete. Recovery and cleanup confirmed. Selected apps on the source remain stopped.' :
-                phase ? 'Migration incomplete or failed. Inspect app state and recovery results before retrying. Provider-scoped approvals may need manual reauthorization.' : '';
+                phase || needsAttention ? 'Migration incomplete or failed. See details.' : '';
             msg.className = msg.textContent ? 'msg ' + (res.running ? 'msg-pending' : complete ? 'msg-ok' : 'msg-err') : '';
             if (!res.running && !complete) {
                 const safeErrors = [
@@ -1772,6 +1781,7 @@
                 }
             }
             document.getElementById('btn-migrate').textContent = res.running ? 'Migrating...' : 'Validate and migrate';
+            document.getElementById('mig-report').hidden = !details.hasChildNodes();
             updateMigAppsButtons();
         }
 

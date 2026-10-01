@@ -217,18 +217,26 @@ async def select_snapshot(page, short_id="aaaaaaaa"):
     await page.get_by_role("button", name="Select snapshot " + short_id).click()
 
 
-async def test_scope_badges_keyboard_selection_and_file_browser(browser_ui):
+async def test_snapshot_contents_keyboard_selection_and_file_browser(browser_ui):
     page, _ = browser_ui
-    for label in ["Configuration + runtime", "Configuration: limited runtime", "Legacy: files only"]:
-        await expect(page.get_by_text(label, exact=True)).to_be_visible()
+    await expect(page.get_by_role("columnheader", name="Recovery scope")).to_have_count(0)
     legacy = page.get_by_role("button", name="Select snapshot cccccccc")
     await legacy.focus()
     await page.keyboard.press("Enter")
-    await expect(page.locator("#selected-snapshot-scope")).to_contain_text("Cannot recreate missing app definitions or API keys")
+    contents = page.locator("#selected-snapshot-contents")
+    await expect(contents).to_have_text("Files only")
+    await expect(page.locator("#selected-snapshot-scope")).to_be_hidden()
+    await contents.focus()
+    await page.keyboard.press("Enter")
+    await expect(page.locator("#selected-snapshot-scope")).to_be_visible()
+    await expect(page.locator("#selected-snapshot-scope")).to_contain_text("App definitions, API keys and app states are not included")
     await page.get_by_role("button", name="Browse", exact=True).click()
     await expect(page.get_by_role("button", name="📁 app_data")).to_be_visible()
     await select_snapshot(page, "bbbbbbbb")
+    await expect(contents).to_have_text("Files and app definitions")
     await expect(page.locator("#selected-snapshot-scope")).to_contain_text("were not captured")
+    await select_snapshot(page)
+    await expect(contents).to_have_text("Files and settings")
 
 
 async def test_restore_acceptance_busy_and_eventual_verified_success(browser_ui):
@@ -248,6 +256,9 @@ async def test_restore_acceptance_busy_and_eventual_verified_success(browser_ui)
     api.restore.update(running=False, last_status="success", last_restore=SNAPSHOT,
                        progress={"phase": "complete", "recovery": recovery(ok=True)})
     await expect(page.locator("#restore-state")).to_contain_text("Restore complete")
+    await expect(page.locator("#restore-details")).to_be_hidden()
+    await page.locator("#restore-report > summary").click()
+    await expect(page.locator("#restore-details")).to_be_visible()
     await expect(page.locator("#restore-details")).to_contain_text("3 expected, 2 added, 1 already present. Import confirmed.")
     await expect(page.locator("#restore-details")).to_contain_text("notes: confirmed")
     await expect(button).to_be_enabled()
@@ -327,7 +338,7 @@ async def test_private_restore_status_is_never_rendered(browser_ui):
 async def test_limited_restore_and_status_loss_never_claim_full_recovery(browser_ui):
     page, api = browser_ui
     api.restore.update(last_status="success", progress={"phase": "complete", "recovery": recovery(ok=True, runtime=False)})
-    await expect(page.locator("#restore-state")).to_contain_text("limited runtime scope")
+    await expect(page.locator("#restore-state")).to_contain_text("limited settings")
     await expect(page.locator("#restore-details")).to_contain_text("Configure these manually")
     api.restore_offline = True
     await expect(page.locator("#restore-state")).to_contain_text("Completion has not been confirmed")
@@ -598,6 +609,7 @@ async def test_incoming_migration_acknowledgment_sends_owner_authority(browser_u
         "phase": "interrupted", "session_id": session_id, "retained_sessions": [session_id],
         "needs_attention": True, "acknowledged": False, "result": None,
     }
+    await page.locator("#mig-report > summary").click()
     await expect(page.get_by_role("button", name="Acknowledge incoming migration")).to_be_visible()
     await page.get_by_role("button", name="Acknowledge incoming migration").click()
     await expect(page.locator("#manage-msg")).to_contain_text("Owner authorization required")
@@ -621,12 +633,14 @@ async def test_outgoing_migration_attention_blocks_push_until_acknowledged(brows
         "restart_pending": ["other"],
     }
     details = page.locator("#mig-details")
+    await expect(page.locator("#mig-state")).to_contain_text("See details")
     await expect(details).to_contain_text("Outgoing migration from this instance requires owner inspection")
     await expect(details).to_contain_text("Backups and new migrations stay blocked")
     await expect(details).to_contain_text("Affected apps: notes")
     await expect(details).to_contain_text("Pending restart: other")
     await expect(details).to_contain_text("Destination apps before this migration:")
     await expect(details).to_contain_text("notes / previous state: running")
+    await page.locator("#mig-report > summary").click()
     await expect(page.locator("#btn-acknowledge-source-migration")).to_be_visible()
     await page.get_by_role("button", name="Acknowledge outgoing migration").click()
     await expect(page.locator("#mig-msg")).to_contain_text("Owner authorization required")

@@ -102,7 +102,7 @@ Each successful backup creates a restic snapshot tagged with `bottle`. Older sna
 - Delete a snapshot (runs `restic forget --prune` to reclaim space)
 - Name or rename a snapshot for easier identification
 
-Recovery-scope badges distinguish configuration plus runtime, configuration with limited runtime, and legacy file-only snapshots. Legacy snapshots remain usable but cannot recreate missing app definitions or API keys.
+Select a snapshot and expand its contents summary to see which files and settings were captured. Legacy snapshots remain usable but cannot recreate missing app definitions or API keys.
 
 The Status panel shows the **repo size**, the deduplicated, compressed on-disk footprint (`restic stats --mode raw-data`). Because computing it is slow on large/remote repos, the value is cached: it is recomputed and stored after each backup and after a snapshot delete/prune, and served from the cache on page load. The backup history database is reconciled against restic on every snapshot listing, so rows for snapshots that no longer exist are cleaned up automatically.
 
