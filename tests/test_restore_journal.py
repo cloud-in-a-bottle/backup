@@ -98,7 +98,7 @@ async def test_successful_history_does_not_expand_new_failed_job(environment, mo
             raise ConfigurationError("stop_failed")
 
     monkeypatch.setattr(backup_app, "RecoverySession", Failing)
-    snapshot = snapshots.Snapshot("a" * 64, (str(snapshots.CONFIGURATION_FILE),), True, True)
+    snapshot = snapshots.Snapshot("a" * 64, (str(snapshots.CONFIGURATION_FILE),), True, True, capture_complete=True)
     with pytest.raises(ConfigurationError):
         await backup_app._restore_configuration_snapshot(snapshot, conf, OWNER_CREDENTIAL)
     backup_app._load_restore_journal()
@@ -112,7 +112,7 @@ async def test_failed_retry_keeps_original_coverage_and_roots(environment, monke
     backup_app._restore_needs_attention = True
     monkeypatch.setattr(snapshots, "read_configuration", AsyncMock(return_value=bundle(runtime=True)))
     monkeypatch.setattr(backup_app, "RecoverySession", Session)
-    snapshot = snapshots.Snapshot("a" * 64, (str(backup_app.APP_TEMP_DATA), str(snapshots.CONFIGURATION_FILE)), True, True)
+    snapshot = snapshots.Snapshot("a" * 64, (str(backup_app.APP_TEMP_DATA), str(snapshots.CONFIGURATION_FILE)), True, True, capture_complete=True)
     before = copy.deepcopy(backup_app.restore_progress)
     with pytest.raises(snapshots.SnapshotConfigurationError):
         await backup_app._restore_configuration_snapshot(snapshot, conf, OWNER_CREDENTIAL)
@@ -159,7 +159,7 @@ async def test_journal_persistence_failure_precedes_recovery_actions(environment
     monkeypatch.setattr(snapshots, "read_configuration", AsyncMock(return_value=bundle(runtime=True)))
     monkeypatch.setattr(backup_app, "RecoverySession", Recorded)
     _reject_directory_fsync(monkeypatch)
-    snapshot = snapshots.Snapshot("a" * 64, (str(backup_app.APP_TEMP_DATA), str(snapshots.CONFIGURATION_FILE)), True, True)
+    snapshot = snapshots.Snapshot("a" * 64, (str(backup_app.APP_TEMP_DATA), str(snapshots.CONFIGURATION_FILE)), True, True, capture_complete=True)
     with pytest.raises(snapshots.SnapshotConfigurationError):
         await backup_app._restore_configuration_snapshot(snapshot, conf, OWNER_CREDENTIAL)
     assert called == []
@@ -430,3 +430,43 @@ async def test_post_commit_disposal_failure_keeps_retained_reference(environment
     saved = json.loads(backup_app._restore_journal_path().read_text())
     assert saved["phase"] == "complete" and saved["needs_attention"] is False
     assert saved["retained_stages"] == retained
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_restart_preserves_safe_results_and_limited_scope(environment, complete):
+    from recovery import _RUNTIME_MISSING
+    result = {"ok": complete, "runtime_captured": False, "runtime_complete": False,
+              "apps": [{"name": "demo", "outcome": "restored" if complete else "failed", "ok": complete,
+                        "token_hash": "private-canary"}],
+              "tokens": {"expected": 1, "added": 1, "existing": 0, "confirmed": True, "name": "private-canary"},
+              "warnings": [_RUNTIME_MISSING, "private-canary"], "definitions": {"private": "private-canary"}}
+    snapshots.save_journal(backup_app._restore_journal_path(), state(
+        phase="complete" if complete else "incomplete", needs_attention=not complete, recovery=result))
+    backup_app._load_restore_journal()
+    saved = backup_app.restore_progress["recovery"]
+    assert saved["runtime_captured"] is False and saved["runtime_complete"] is False
+    assert saved["apps"][0]["ok"] is complete and saved["tokens"]["confirmed"]
+    assert saved["warnings"] == [_RUNTIME_MISSING]
+    assert "private-canary" not in json.dumps(backup_app.restore_progress)
+    assert backup_app._restore_needs_attention is (not complete)
+
+
+async def test_post_commit_checkpoint_failure_does_not_reverse_completion(environment, monkeypatch):
+    assert await backup_app.run_backup()
+    snapshot = await newest_snapshot()
+    monkeypatch.setattr(backup_app, "RecoverySession", Session)
+    checkpoint = backup_app._checkpoint_restore
+    completed = 0
+    def fail_second(phase, *, needs_attention=False):
+        nonlocal completed
+        if phase == "complete":
+            completed += 1
+            if completed == 2:
+                raise OSError("post-commit bookkeeping unavailable")
+        checkpoint(phase, needs_attention=needs_attention)
+    monkeypatch.setattr(backup_app, "_checkpoint_restore", fail_second)
+    assert await _restore(backup_app, snapshot)
+    assert completed == 2 and backup_app.restore_last_status == "success"
+    assert not backup_app._restore_needs_attention
+    backup_app._load_restore_journal()
+    assert not backup_app._restore_needs_attention and backup_app.restore_last_status == "success"

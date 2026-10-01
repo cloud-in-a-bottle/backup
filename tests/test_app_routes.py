@@ -1048,7 +1048,7 @@ class TestZoneTagging:
         assert backup_app._backup_tags("nightly") == [
             "bottle",
             f"zone:{self.ZONE}",
-            "name:nightly",
+            "name-uri:nightly",
         ]
 
     def test_has_app_tag_accepts_bottle_and_legacy_openhost(self, client):
@@ -1061,7 +1061,7 @@ class TestZoneTagging:
 
     def test_backup_tags_fall_back_when_zone_unset(self, client, monkeypatch):
         monkeypatch.setattr(backup_app, "ZONE_DOMAIN", "")
-        assert backup_app._backup_tags("nightly") == ["bottle", "name:nightly"]
+        assert backup_app._backup_tags("nightly") == ["bottle", "name-uri:nightly"]
 
     @pytest.mark.parametrize("foreign_tag", ["bottle", "openhost"])
     async def test_list_snapshots_includes_other_instances_and_preserves_history(
@@ -1280,7 +1280,7 @@ class TestRetention:
             summary = json.dumps(
                 {
                     "message_type": "summary",
-                    "snapshot_id": "s" * 64,
+                    "snapshot_id": "a" * 64,
                     "data_added": 1,
                     "total_bytes_processed": 2,
                     "total_files_processed": 3,
@@ -1289,8 +1289,12 @@ class TestRetention:
             return 0, (summary + "\n").encode(), b""
 
         monkeypatch.setattr(backup_app, "_run_restic", fake_run_restic)
+        completion = AsyncMock(return_value="b" * 64)
+        monkeypatch.setattr(backup_app.snapshot_configuration, "complete_capture", completion)
         ok = await backup_app.run_backup()
         assert ok is True
+        assert completion.await_args.args[0] == "a" * 64
+        assert backup_app.get_backup_history()[0][0]["snapshot_id"] == "b" * 64
         args = captured["args"]
         assert args[0] == "backup"
         assert args[args.index("--host") + 1] == backup_app.BACKUP_HOST

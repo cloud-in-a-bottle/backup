@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import stat
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -94,6 +95,10 @@ async def test_real_restic_snapshot_contains_private_configuration_and_data(envi
     capture.assert_awaited_once_with(backup_app.ROUTER_URL, "synthetic-app-token", OWNER_CREDENTIAL, "backup")
     saved = await newest_snapshot()
     assert saved["has_configuration"] and saved["has_runtime"]
+    assert saved["capture_complete"]
+    assert snapshots.CAPTURE_COMPLETE_TAG in saved["tags"]
+    assert saved["name"] == "configuration recovery"
+    assert backup_app.get_backup_history()[0][0]["snapshot_id"] == saved["id"]
     assert {str(data), str(temporary), str(snapshots.CONFIGURATION_FILE)} == set(saved["paths"])
     parsed = await snapshots.read_configuration(saved["id"], backup_app._restic_env(conf))
     assert parsed == bundle(runtime=True)
@@ -129,6 +134,88 @@ async def test_export_failure_creates_no_snapshot_or_plaintext_artifact(environm
     assert not backup_app.op_lock.busy
     assert "Private" in backup_app.get_last_backup()["error_message"]
     assert RAW_KEY not in caplog.text and OWNER_CREDENTIAL not in caplog.text
+
+
+@pytest.mark.parametrize("name", [None, "rescue,bottle-capture-complete-v1"])
+async def test_partial_snapshot_cannot_delete_omitted_destination_files(environment, monkeypatch, name):
+    data, _, _, conf, _ = environment
+    assert await backup_app.run_backup()
+    assert (await newest_snapshot())["capture_complete"]
+    valuable = data / "demo" / "valuable.txt"
+    valuable.write_text("valid destination data")
+    valuable.chmod(0)
+    try:
+        if os.access(valuable, os.R_OK):
+            pytest.skip("Unreadable-file reproduction requires an unprivileged restic process")
+        assert not await backup_app.run_backup(name=name)
+    finally:
+        valuable.chmod(0o600)
+    saved = await newest_snapshot()
+    assert saved["has_configuration"] and not saved["capture_complete"]
+    assert saved["name"] == name
+    # Recovery must not rely on this instance's history: another destination
+    # discovers this same partial snapshot through its repository alone.
+    with backup_app.get_db() as db:
+        db.execute("DELETE FROM backups")
+    db.close()
+    monkeypatch.setattr(backup_app, "RecoverySession", lambda *args: pytest.fail("Partial capture must not start recovery"))
+    assert not await backup_app.run_restore(saved["id"], owner_token=OWNER_CREDENTIAL)
+    assert "no confirmed complete capture" in backup_app.restore_last_status
+    assert valuable.read_text() == "valid destination data"
+    assert not (data / backup_app.RESTORE_WORK_NAME).exists()
+    assert await backup_app.run_restore(saved["id"], root="app_data")
+    assert valuable.read_text() == "valid destination data"
+
+
+async def test_lost_completion_publication_keeps_snapshot_unconfirmed(environment, monkeypatch):
+    monkeypatch.setattr(snapshots, "complete_capture", AsyncMock(side_effect=snapshots.SnapshotConfigurationError("publication failed")))
+    assert not await backup_app.run_backup()
+    saved = await newest_snapshot()
+    assert not saved["capture_complete"]
+    assert not await backup_app.run_restore(saved["id"], owner_token=OWNER_CREDENTIAL)
+
+
+async def test_append_only_completion_does_not_require_deleting_predecessor(environment, monkeypatch):
+    data, _, _, conf, _ = environment
+    original_read = snapshots.restic_process.read
+    predecessors = []
+    async def append_only_tag(args, env, **kwargs):
+        if args[0] != "tag":
+            return await original_read(args, env, **kwargs)
+        predecessor = Path(conf["repo"]) / "snapshots" / args[-1]
+        encrypted = predecessor.read_bytes()
+        await original_read(args, env, **kwargs)
+        # Simulate only the backend's DELETE refusal, after restic has published
+        # the real encrypted completion object. Its documented JSON result then
+        # lacks a changed acknowledgment; both objects remain in the repository.
+        predecessor.write_bytes(encrypted)
+        predecessors.append(predecessor.name)
+        return b'{"message_type":"summary","changed_snapshots":0}\n'
+    monkeypatch.setattr(snapshots.restic_process, "read", append_only_tag)
+    assert await backup_app.run_backup()
+    entries, ok = await backup_app.list_snapshots()
+    assert ok and len(entries) == 2
+    complete = next(entry for entry in entries if entry["capture_complete"])
+    incomplete = next(entry for entry in entries if not entry["capture_complete"])
+    assert incomplete["id"] == predecessors[0] and complete["id"] != incomplete["id"]
+    assert backup_app.get_backup_history()[0][0]["snapshot_id"] == complete["id"]
+    (data / "demo" / "secret.txt").write_text("destination data")
+    monkeypatch.setattr(backup_app, "RecoverySession", FakeRecovery)
+    assert await backup_app.run_restore(complete["id"], owner_token=OWNER_CREDENTIAL)
+
+
+@pytest.mark.parametrize("origin", [None, "wrong", "b" * 64])
+def test_capture_marker_must_match_original_snapshot(origin):
+    entry = {"original": origin, "tags": [snapshots.CAPTURE_COMPLETE_TAG, snapshots.CAPTURE_ORIGIN_PREFIX + "a" * 64]}
+    assert not snapshots.is_complete_capture(entry)
+
+
+@pytest.mark.parametrize("output", [b'{"message_type":"summary","changed_snapshots":0}\n', b'{}\n', b'[]\n',
+    b'{"message_type":"changed","old_snapshot_id":"wrong","new_snapshot_id":"wrong"}\n'])
+async def test_capture_completion_requires_positive_snapshot_acknowledgment(monkeypatch, output):
+    monkeypatch.setattr(snapshots.restic_process, "read", AsyncMock(return_value=output))
+    with pytest.raises(snapshots.SnapshotConfigurationError, match="completion"):
+        await snapshots.complete_capture("a" * 64, {})
 
 
 async def test_configuration_capture_without_owner_key_remains_explicit(environment):

@@ -1261,6 +1261,442 @@ async def test_private_git_consumers_wait_for_oauth_even_without_app_grants(mock
     assert ready < selected < clone
 
 
+@pytest.mark.parametrize("provider_state", ["missing", "stopped", "error"])
+async def test_public_repository_does_not_require_unselected_oauth(mock_http, provider_state):
+    full = make_bundle("public-app", "oauth", runtime=True)
+    add_runtime_provider(full, OAUTH, "oauth")
+    bundle = subset_configuration(full, {"public-app"})
+    entries = [] if provider_state == "missing" else [inventory_entry("oauth", "Q" * 12, provider_state)]
+    router = Router(bundle, entries)
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"] is True
+    assert router.installs() == ["public-app"]
+    assert not router.mutations("/api/services/v2/defaults")
+
+
+async def test_public_install_survives_failed_selected_oauth(mock_http):
+    bundle = make_bundle("public-app", "oauth", runtime=True)
+    add_runtime_provider(bundle, OAUTH, "oauth")
+    router = Router(bundle)
+    router.deploy_states["oauth"] = ["error"]
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    result = await session.activate()
+    await session.restart_unaffected()
+    assert router.installs() == ["oauth", "public-app"]
+    assert next(a for a in result["apps"] if a["name"] == "public-app")["ok"]
+    assert not result["ok"], "The failed selected OAuth app remains an incomplete recovery"
+
+
+async def test_retained_provider_and_its_prerequisite_resume_before_consumer(mock_http):
+    full = make_bundle("notes", "secrets", runtime=True)
+    add_runtime_provider(full, SECRETS, "secrets")
+    add_global(full, "notes", SECRETS, {"key": "DB_URL"})
+    bundle = subset_configuration(full, {"notes"})
+    router = Router(bundle, [inventory_entry("secrets", "S" * 12), inventory_entry("database", "D" * 12)])
+    router.add_provider("database-service", "database")
+    router.permissions.append({"consumer_app_id": "S" * 12, "service_url": "database-service", "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    original = router.listing
+    def listing():
+        # Secrets cannot finish starting until its existing backing database is up.
+        if router.apps["database"]["status"] != "running" and "secrets" in router.workers:
+            router.workers["secrets"] = ["starting", "running"]
+        return original()
+    router.listing = listing
+    mock_http(router)
+    session = session_for(bundle, timeout=1)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"] is True
+    assert router.installs() == ["notes"]
+    assert all(app["status"] == "running" for app in router.apps.values())
+
+
+async def test_unrelated_consumer_waits_until_selected_apps_activate(mock_http):
+    full = make_bundle("a-notes", "z-selected", "external", runtime=True)
+    add_runtime_provider(full, SECRETS, "external")
+    add_global(full, "a-notes", SECRETS, {})
+    bundle = subset_configuration(full, {"a-notes", "z-selected"})
+    router = Router(bundle, [inventory_entry("external", "E" * 12), inventory_entry("consumer", "C" * 12)])
+    def reload_consumer(request, body):
+        router.deploy_states["consumer"] = ["running"] if router.apps.get("z-selected", {}).get("status") == "running" else ["error"]
+    router.hooks["/reload_app/" + "C" * 12] = reload_consumer
+    mock_http(router)
+    session = session_for(bundle, timeout=1)
+    await prepare(router, session)
+    await session.activate()
+    result = await session.restart_unaffected()
+    assert result["ok"] and router.apps["consumer"]["status"] == "running"
+    assert next(p for p in result["paused_apps"] if p["name"] == "consumer")["restart"] == "confirmed"
+    assert len(router.mutations("/reload_app/" + "C" * 12)) == 1
+
+
+async def test_private_github_clone_can_use_resumed_destination_oauth(mock_http):
+    bundle = make_bundle("notes", runtime=True)
+    bundle["definitions"]["apps"][0]["source"]["repo_url"] = "https://github.com/example/private"
+    router = Router(bundle, [inventory_entry("oauth", "Q" * 12), inventory_entry("secrets", "S" * 12)])
+    router.add_provider(OAUTH, "oauth")
+    def install(request, body):
+        assert router.apps["oauth"]["status"] == "running"
+    router.hooks["/api/add_app"] = install
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+
+
+async def test_public_github_clones_share_one_optional_oauth_wait(mock_http):
+    names = [f"public-{i}" for i in range(4)]
+    bundle = make_bundle(*names, runtime=True)
+    for app in bundle["definitions"]["apps"]:
+        app["source"]["repo_url"] = "https://github.com/example/" + app["name"]
+    router = Router(bundle, [inventory_entry("oauth", "Q" * 12)])
+    router.add_provider(OAUTH, "oauth")
+    router.deploy_states["oauth"] = ["starting"] * 10000
+    mock_http(router)
+    session = RecoverySession(ORIGIN, OWNER_TOKEN, bundle, deployment_timeout=1, request_timeout=0.02, poll_interval=0.001)
+    original = session._provider_ready
+    waits = []
+    async def provider_ready(service, name):
+        waits.append((service, name))
+        return await original(service, name)
+    session._provider_ready = provider_ready
+    await prepare(router, session)
+    await session.activate()
+    assert router.installs() == names and router.apps["oauth"]["status"] == "starting"
+    assert waits == [(OAUTH, "oauth")]
+    router.workers["oauth"] = ["running"]
+    assert (await session.restart_unaffected())["ok"]
+
+
+async def test_cancelled_activation_owns_early_restarts_through_cleanup(mock_http):
+    from operations import OperationLock, OpKind, drain
+    full = make_bundle("a-notes", "b-later", "secrets", "slow", runtime=True)
+    add_runtime_provider(full, SECRETS, "secrets")
+    add_runtime_provider(full, "slow-service", "slow")
+    add_global(full, "a-notes", SECRETS, {})
+    add_global(full, "a-notes", "slow-service", {})
+    bundle = subset_configuration(full, {"a-notes", "b-later"})
+    router = Router(bundle, [inventory_entry("secrets", "S" * 12), inventory_entry("slow", "T" * 12),
+                             inventory_entry("flaky", "F" * 12)])
+    slow_entered, release_slow = asyncio.Event(), asyncio.Event()
+    async def slow(request, body):
+        slow_entered.set()
+        await release_slow.wait()
+    def flaky(request, body):
+        router.deploy_states["flaky"] = ["running"] if router.apps.get("a-notes", {}).get("status") == "running" else ["error"]
+    router.hooks.update({"/reload_app/" + "T" * 12: slow, "/reload_app/" + "F" * 12: flaky})
+    mock_http(router)
+    session = session_for(bundle, timeout=2)
+    lock = OperationLock()
+    async def operation():
+        assert lock.try_acquire(OpKind.RESTORE) is None
+        try:
+            await prepare(router, session)
+            await session.activate()
+        finally:
+            try:
+                await drain(session.restart_unaffected())
+            finally:
+                lock.release(OpKind.RESTORE)
+    task = asyncio.create_task(operation())
+    try:
+        await asyncio.wait_for(slow_entered.wait(), 1)
+        assert slow_entered.is_set() and router.apps["secrets"]["status"] == "running"
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert lock.busy and not task.done()
+    finally:
+        release_slow.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 3)
+    assert not lock.busy and not session._resume_tasks
+    assert all(router.apps[n]["status"] == "running" for n in ("secrets", "slow", "flaky"))
+
+
+async def test_unrelated_provider_waits_for_later_selected_prerequisite(mock_http):
+    full = make_bundle("a-consumer", "b-database", "c-consumer", "x-provider", "y-provider", runtime=True)
+    add_runtime_provider(full, "service-x", "x-provider")
+    add_runtime_provider(full, "service-y", "y-provider")
+    add_global(full, "a-consumer", "service-x", {})
+    add_global(full, "c-consumer", "service-y", {})
+    bundle = subset_configuration(full, {"a-consumer", "b-database", "c-consumer"})
+    router = Router(bundle, [inventory_entry("x-provider", "X" * 12), inventory_entry("y-provider", "Y" * 12)])
+    router.deploy_states["x-provider"] = ["building"] * 5 + ["running"]
+    def reload_y(request, body):
+        router.deploy_states["y-provider"] = ["running"] if router.apps.get("b-database", {}).get("status") == "running" else ["error"]
+    router.hooks["/reload_app/" + "Y" * 12] = reload_y
+    mock_http(router)
+    session = session_for(bundle, timeout=1)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert router.installs() == ["a-consumer", "b-database", "c-consumer"]
+    assert len(router.mutations("/reload_app/" + "Y" * 12)) == 1
+
+
+async def test_unrelated_consumer_never_starts_with_superseded_default(mock_http):
+    full = make_bundle("a-gateway", "z-secrets", "external", runtime=True)
+    add_runtime_provider(full, "gateway-service", "a-gateway")
+    add_runtime_provider(full, SECRETS, "z-secrets")
+    add_runtime_provider(full, "external-service", "external")
+    add_global(full, "a-gateway", "external-service", {})
+    add_global(full, "z-secrets", "gateway-service", {})
+    bundle = subset_configuration(full, {"a-gateway", "z-secrets"})
+    router = Router(bundle, [inventory_entry("external", "E" * 12), inventory_entry("old-secrets", "Q" * 12),
+                             inventory_entry("consumer", "C" * 12)])
+    router.add_provider(SECRETS, "old-secrets")
+    router.permissions.append({"consumer_app_id": "C" * 12, "service_url": SECRETS, "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    observed_defaults = []
+    def consumer_start(request, body):
+        observed_defaults.append(router.defaults[SECRETS])
+    router.hooks["/reload_app/" + "C" * 12] = consumer_start
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert observed_defaults == ["z-secrets"]
+
+
+async def test_retained_provider_waits_for_its_selected_default_prerequisite(mock_http):
+    full = make_bundle("a-gateway", "z-database", "external", runtime=True)
+    add_runtime_provider(full, "gateway-service", "a-gateway")
+    add_runtime_provider(full, "database-service", "z-database")
+    add_runtime_provider(full, "external-service", "external")
+    add_global(full, "a-gateway", "external-service", {})
+    bundle = subset_configuration(full, {"a-gateway", "z-database"})
+    router = Router(bundle, [inventory_entry("external", "E" * 12), inventory_entry("old-database", "D" * 12)])
+    router.add_provider("database-service", "old-database")
+    router.permissions.append({"consumer_app_id": "E" * 12, "service_url": "database-service", "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    observed = []
+    def provider_start(request, body):
+        observed.append(router.defaults["database-service"])
+    router.hooks["/reload_app/" + "E" * 12] = provider_start
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert router.installs() == ["z-database", "a-gateway"]
+    assert observed == ["z-database"]
+
+
+async def test_retained_prerequisite_default_is_selected_before_consumer_restart(mock_http):
+    full = make_bundle("a-client", "z-client", "provider-x", "provider-y", runtime=True)
+    add_runtime_provider(full, "service-x", "provider-x")
+    add_runtime_provider(full, "database-service", "provider-y")
+    add_global(full, "a-client", "service-x", {})
+    add_global(full, "z-client", "database-service", {})
+    bundle = subset_configuration(full, {"a-client", "z-client"})
+    router = Router(bundle, [inventory_entry("provider-x", "X" * 12), inventory_entry("provider-y", "Y" * 12),
+                             inventory_entry("old-database", "D" * 12)])
+    router.add_provider("database-service", "old-database")
+    router.permissions.append({"consumer_app_id": "X" * 12, "service_url": "database-service", "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    observed = []
+    def provider_start(request, body):
+        observed.append((router.defaults["database-service"], router.apps["provider-y"]["status"]))
+    router.hooks["/reload_app/" + "X" * 12] = provider_start
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert observed == [("provider-y", "running")]
+
+
+async def test_github_bootstrap_does_not_resume_superseded_oauth(mock_http):
+    bundle = make_bundle("notes", "z-oauth", runtime=True)
+    bundle["definitions"]["apps"][0]["source"]["repo_url"] = "https://github.com/example/private"
+    add_runtime_provider(bundle, OAUTH, "z-oauth")
+    router = Router(bundle, [inventory_entry("old-oauth", "Q" * 12)])
+    router.add_provider(OAUTH, "old-oauth")
+    def installing(request, body):
+        if body["app_name"] == "notes":
+            assert router.defaults[OAUTH] == "z-oauth"
+            assert router.apps["old-oauth"]["status"] == "stopped"
+    router.hooks["/api/add_app"] = installing
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+
+
+async def test_destination_oauth_prerequisites_get_optional_bootstrap_priority(mock_http):
+    bundle = make_bundle("a-private", "z-secrets", runtime=True)
+    bundle["definitions"]["apps"][0]["source"]["repo_url"] = "https://github.com/example/private"
+    add_runtime_provider(bundle, "private-service", "a-private")
+    add_runtime_provider(bundle, SECRETS, "z-secrets")
+    router = Router(bundle, [inventory_entry("oauth", "Q" * 12)])
+    router.add_provider(OAUTH, "oauth")
+    router.permissions.append({"consumer_app_id": "Q" * 12, "service_url": SECRETS, "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    def installing(request, body):
+        if body["app_name"] == "a-private":
+            assert router.apps["oauth"]["status"] == "running"
+            assert router.defaults[SECRETS] == "z-secrets"
+    router.hooks["/api/add_app"] = installing
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert router.installs() == ["z-secrets", "a-private"]
+
+
+async def test_retained_cycle_waits_for_external_prerequisites_before_bootstrap(mock_http):
+    full = make_bundle("notes", "provider-b", runtime=True)
+    add_runtime_provider(full, "service-b", "provider-b")
+    add_global(full, "notes", "service-b", {})
+    bundle = subset_configuration(full, {"notes"})
+    router = Router(bundle, [inventory_entry("provider-a", "A" * 12), inventory_entry("provider-b", "B" * 12),
+                             inventory_entry("database", "D" * 12)])
+    router.add_provider("service-a", "provider-a")
+    router.add_provider("database-service", "database")
+    router.permissions = [
+        {"consumer_app_id": consumer * 12, "service_url": service, "grant": {}, "scope": "global", "provider_app_id": None}
+        for consumer, service in [("A", "service-b"), ("A", "database-service"), ("B", "service-a")]
+    ]
+    router.deploy_states["database"] = ["building"] * 5 + ["running"]
+    def boot_b(request, body):
+        router.deploy_states["provider-b"] = ["running"] if router.apps["database"]["status"] == "running" else ["error"]
+    router.hooks["/reload_app/" + "B" * 12] = boot_b
+    mock_http(router)
+    session = session_for(bundle, timeout=1)
+    await prepare(router, session)
+    await session.activate()
+    assert (await session.restart_unaffected())["ok"]
+    assert router.installs() == ["notes"]
+    assert len(router.mutations("/reload_app/" + "B" * 12)) == 1
+
+
+async def test_missing_retained_default_does_not_block_independent_recovery(mock_http):
+    full = make_bundle("dependent", "independent", "external", runtime=True)
+    add_runtime_provider(full, "external-service", "external")
+    add_global(full, "dependent", "external-service", {})
+    bundle = subset_configuration(full, {"dependent", "independent"})
+    router = Router(bundle)
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    result = await session.restart_unaffected()
+    assert not result["ok"] and router.installs() == ["independent"]
+    assert next(app for app in result["apps"] if app["name"] == "independent")["ok"]
+
+
+@pytest.mark.parametrize("fault", ["refused", "unreachable"])
+async def test_refused_default_never_restarts_retained_consumer_against_old_backend(mock_http, fault):
+    full = make_bundle("notes", "db-client", "gateway", "database", runtime=True)
+    add_runtime_provider(full, "gateway-service", "gateway")
+    add_runtime_provider(full, "database-service", "database")
+    add_global(full, "notes", "gateway-service", {})
+    add_global(full, "db-client", "database-service", {})
+    bundle = subset_configuration(full, {"notes", "db-client"})
+    router = Router(bundle, [inventory_entry("gateway", "G" * 12), inventory_entry("database", "D" * 12),
+                             inventory_entry("old-database", "T" * 12)])
+    router.add_provider("database-service", "old-database")
+    router.permissions.append({"consumer_app_id": "G" * 12, "service_url": "database-service", "grant": {},
+                               "scope": "global", "provider_app_id": None})
+    def refuse(request, body):
+        if body["service_url"] == "database-service":
+            return httpx.Response(403, json={"error": "refused"})
+    if fault == "refused":
+        router.hooks["/api/services/v2/defaults"] = refuse
+    else:
+        def unavailable(request, body):
+            if session._phase == "activating":
+                return httpx.Response(503, json={"error": "unavailable"})
+        router.hooks["/api/services/v2"] = unavailable
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    result = await session.restart_unaffected()
+    assert not result["ok"] and not router.mutations("/reload_app/" + "G" * 12)
+    assert router.apps["gateway"]["status"] == "stopped"
+
+
+async def test_blocked_default_gates_every_member_of_retained_cycle(mock_http):
+    full = make_bundle("notes", "db-client", "provider-b", "database", runtime=True)
+    add_runtime_provider(full, "service-b", "provider-b")
+    add_runtime_provider(full, "database-service", "database")
+    add_global(full, "notes", "service-b", {})
+    add_global(full, "db-client", "database-service", {})
+    bundle = subset_configuration(full, {"notes", "db-client"})
+    router = Router(bundle, [inventory_entry("provider-a", "A" * 12), inventory_entry("provider-b", "B" * 12),
+                             inventory_entry("database", "D" * 12), inventory_entry("old-database", "T" * 12)])
+    router.add_provider("service-a", "provider-a")
+    router.add_provider("database-service", "old-database")
+    router.permissions = [
+        {"consumer_app_id": consumer * 12, "service_url": service, "grant": {}, "scope": "global", "provider_app_id": None}
+        for consumer, service in [("A", "service-b"), ("A", "database-service"), ("B", "service-a")]
+    ]
+    def refuse(request, body):
+        if body["service_url"] == "database-service":
+            return httpx.Response(403, json={"error": "refused"})
+    router.hooks["/api/services/v2/defaults"] = refuse
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    assert not (await session.restart_unaffected())["ok"]
+    assert not router.mutations("/reload_app/" + "A" * 12)
+    assert not router.mutations("/reload_app/" + "B" * 12)
+
+
+async def test_failed_default_catalogue_read_preserves_independent_activation(mock_http):
+    full = make_bundle("dependent", "independent", "external", runtime=True)
+    add_runtime_provider(full, "external-service", "external")
+    add_global(full, "dependent", "external-service", {})
+    bundle = subset_configuration(full, {"dependent", "independent"})
+    router = Router(bundle, [inventory_entry("external", "E" * 12)])
+    def unavailable(request, body):
+        if session._phase == "activating":
+            return httpx.Response(503, json={"error": "unavailable"})
+    router.hooks["/api/services/v2"] = unavailable
+    mock_http(router)
+    session = session_for(bundle)
+    await prepare(router, session)
+    await session.activate()
+    result = await session.restart_unaffected()
+    assert not result["ok"] and router.installs() == ["independent"]
+    assert next(app for app in result["apps"] if app["name"] == "independent")["ok"]
+
+
+@pytest.mark.parametrize("change", ["unaffected-error", "selected-running", "selected-identity"])
+async def test_source_cutover_rechecks_final_states_without_activation(mock_http, change):
+    bundle = make_bundle("selected", runtime=True)
+    router = Router(bundle, [inventory_entry("selected", "S" * 12), inventory_entry("other", "T" * 12)])
+    mock_http(router)
+    session = session_for(bundle)
+    await session.preflight()
+    await session.stop_apps()
+    await session.restart_unaffected()
+    if change == "unaffected-error":
+        router.apps["other"]["status"] = "error"
+    elif change == "selected-running":
+        router.apps["selected"]["status"] = "running"
+    else:
+        router.apps["selected"]["app_id"] = "R" * 12
+    assert not await session.confirm_source_cutover()
+    assert not session.progress["source_cutover_confirmed"]
+    if change == "unaffected-error":
+        assert next(p for p in session.progress["paused_apps"] if p["name"] == "other")["restart"] == "failed"
+
+
 async def test_cycle_requires_bootstrap_instead_of_racing_dependent_installs(mock_http):
     bundle = make_bundle("first", "second", "independent", runtime=True)
     add_runtime_provider(bundle, "service-first", "first")

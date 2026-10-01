@@ -47,6 +47,7 @@ from configuration import (
     ROUTER_PROVIDER,
     TRANSIENT_STATUSES,
     ConfigurationError,
+    _ERRORS as _CONFIGURATION_ERRORS,
     RouterClient,
     _app_id,
     _app_name,
@@ -75,6 +76,7 @@ _DEPENDENCY_CYCLE = "Service-provider dependencies form a cycle; these apps requ
 _DEFAULT_FAILED = "A captured service-provider selection could not be restored."
 _CLEANUP_FAILED = "An unaffected app could not be restarted; check the paused-app journal."
 _FINAL_UNCONFIRMED = "The final recovery state could not be confirmed. Check the router before retrying."
+_OMITTED_DATA = "Captured app data with no exported definition was not restored: "
 
 # Router app states that mean a launch is still in progress rather than
 # finished. The platform reports ``building`` while an image is being built and
@@ -93,6 +95,136 @@ def _failure_outcome(code: str) -> str:
 def _require_ok(response: object) -> None:
     if type(response) is not dict or response.get("ok") is not True:
         raise ConfigurationError("router_response")
+
+
+def journal_progress(value: object) -> dict | None:
+    """Validate/project persisted public results without exposing private fields.
+
+    Unknown fields are discarded. Warning text must come from this executor's
+    fixed messages; the one filename-based warning is rebuilt from its names.
+    Missing fields stay missing for journals written by earlier versions.
+    """
+    if value is None:
+        return None
+    messages = set(_CONFIGURATION_ERRORS.values()) | {
+        _RUNTIME_MISSING, _MANUAL_GRANTS, _STOPPED_START, _UNKNOWN_STATE,
+        _UNAVAILABLE_SOURCE, _DEPENDENCY_CYCLE, _DEFAULT_FAILED, _CLEANUP_FAILED, _FINAL_UNCONFIRMED,
+    }
+
+    def boolean(item):
+        if type(item) is not bool:
+            raise ValueError
+        return item
+
+    def count(item):
+        if type(item) is not int or item < 0:
+            raise ValueError
+        return item
+
+    def choice(*options):
+        def validate(item):
+            if item not in options or (item is not None and type(item) is not str):
+                raise ValueError
+            return item
+        return validate
+
+    def optional(check):
+        return lambda item: None if item is None else check(item)
+
+    def sequence(check):
+        def validate(items):
+            if type(items) is not list:
+                raise ValueError
+            return [check(item) for item in items]
+        return validate
+
+    def project(schema):
+        def validate(record):
+            if type(record) is not dict:
+                raise ValueError
+            return {key: check(record[key]) for key, check in schema.items() if key in record}
+        return validate
+
+    def warnings(items):
+        if type(items) is not list:
+            raise ValueError
+        return [message for message in items if type(message) is str and message in messages]
+
+    def filename(item):
+        if type(item) is not str or not item or "/" in item or "\0" in item:
+            raise ValueError
+        return item
+
+    app = project({
+        "name": _app_name, "app_id": optional(_app_id), "plan_status": choice(None, "existing", "ready", "unavailable"),
+        "action": choice(None, "reload", "install"), "status": choice(None, *APP_STATUSES),
+        "outcome": choice("pending", "failed", "unknown", "unavailable", "blocked", "configuration_conflict",
+                          "install_requested", "install_unconfirmed", "reload_requested", "restored",
+                          "manual_reauthorization", "desired_state_unavailable"),
+        "ok": boolean, "launch_attempts": count, "warnings": warnings,
+    })
+    paused = project({
+        "name": _app_name, "app_id": _app_id, "previous_status": choice(*APP_STATUSES), "selected": boolean,
+        "stop": choice("requested", "confirmed", "uncertain"), "restart": choice("pending", "requested", "confirmed", "failed"),
+        "restart_requested": boolean,
+    })
+    result = project({
+        "ok": boolean, "runtime_captured": boolean, "runtime_complete": boolean,
+        "completion_confirmed": boolean, "source_cutover_confirmed": boolean,
+        "phase": choice("new", "preflighting", "preflighted", "preflight_failed", "stopping", "stopped", "stop_failed",
+                        "activating", "restarting_unaffected", "complete", "incomplete", "interrupted"),
+        "current_app": optional(_app_name), "restore_app_names": sequence(_app_name), "apps": sequence(app),
+        "tokens": project({"expected": count, "added": count, "existing": count, "confirmed": boolean}),
+        "providers": project({"expected_defaults": count, "restored_defaults": count}),
+        "destination_apps_before": lambda items: list(_inventory(items).values()),
+        "omitted_app_data": sequence(filename), "paused_apps": sequence(paused), "warnings": warnings,
+    })(value)
+    if result.get("omitted_app_data"):
+        result.setdefault("warnings", []).append(_omitted_warning(result["omitted_app_data"]))
+    return result
+
+
+def _omitted_warning(names) -> str:
+    return _OMITTED_DATA + ", ".join(names) + ". Recover it from this snapshot's app_data root with a root-specific restore."
+
+
+def _restart_prerequisites(graph: dict[str, set[str]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Condense retained dependency cycles; their members bootstrap together.
+
+    Iterative Kosaraju traversal avoids recursion limits on long app chains.
+    Every member of a component waits for all external prerequisite components.
+    """
+    order, seen = [], set()
+    reverse = {name: set() for name in graph}
+    for name, dependencies in graph.items():
+        for dependency in dependencies:
+            reverse[dependency].add(name)
+        stack = [(name, False)]
+        while stack:
+            current, finished = stack.pop()
+            if finished:
+                order.append(current)
+            elif current not in seen:
+                seen.add(current)
+                stack.append((current, True))
+                stack.extend((dependency, False) for dependency in graph[current] if dependency not in seen)
+    groups, components = {}, []
+    for name in reversed(order):
+        if name in groups:
+            continue
+        component, pending = set(), [name]
+        components.append(component)
+        while pending:
+            current = pending.pop()
+            if current not in groups:
+                component.add(current)
+                groups[current] = component
+                pending.extend(reverse[current])
+    prerequisites = {}
+    for component in components:
+        required = {member for consumer in component for dependency in graph[consumer] - component for member in groups[dependency]}
+        prerequisites.update({name: required for name in component})
+    return prerequisites, groups
 
 
 class RecoverySession:
@@ -136,6 +268,15 @@ class RecoverySession:
         self._omitted_data: list[str] = []
         self._activation_finished = False
         self._completion_confirmed = False
+        self._source_cutover_confirmed = False
+        self._resume_tasks: dict[str, asyncio.Task] = {}
+        self._resume_generation: dict[str, int] = {}
+        self._activation_generation = 0
+        self._clone_oauth: str | None = None
+        self._clone_bootstrap_remaining = min(request_timeout, deployment_timeout)
+        self._external_dependencies: dict[str, set[str]] = {}
+        self._external_services: dict[str, set[str]] = {}
+        self._blocked_defaults: set[str] = set()
         self._warnings = []
         self._apps = {name: {"name": name, "app_id": None, "plan_status": None, "action": None,
                              "status": None, "outcome": "pending", "ok": False, "launch_attempts": 0, "warnings": []}
@@ -161,6 +302,7 @@ class RecoverySession:
             "runtime_captured": self._runtime is not None,
             "runtime_complete": self._runtime is not None and ok,
             "completion_confirmed": self._completion_confirmed,
+            "source_cutover_confirmed": self._source_cutover_confirmed,
             "providers": {"expected_defaults": expected_defaults, "restored_defaults": len(self._defaults_done)},
             "destination_apps_before": list(self._baseline.values()),
             "omitted_app_data": list(self._omitted_data),
@@ -182,11 +324,7 @@ class RecoverySession:
         if not omitted:
             return
         self._omitted_data = omitted
-        self._warn(
-            "Captured app data with no exported definition was not restored: "
-            + ", ".join(omitted)
-            + ". Recover it from this snapshot's app_data root with a root-specific restore."
-        )
+        self._warn(_omitted_warning(omitted))
 
     def _warn(self, message: str, name: str | None = None) -> None:
         warnings = self._warnings if name is None else self._apps[name]["warnings"]
@@ -268,10 +406,11 @@ class RecoverySession:
         except (ValueError, TypeError, KeyError):
             raise ConfigurationError("invalid_plan") from None
 
-    def _build_dependencies(self, destination_providers: list[dict]) -> None:
+    def _build_dependencies(self, destination_providers: list[dict], destination_permissions: list[dict]) -> None:
         self._provider_specs = self._runtime["providers"] if self._runtime is not None else []
         catalogue = self._provider_specs if self._runtime is not None else destination_providers
         defaults = {p["service_url"]: p["app_name"] for p in catalogue if p["is_default"]}
+        self._clone_oauth = defaults.get(OAUTH_SERVICE, self._clone_oauth)
         provider_names = {p["app_name"] for p in catalogue}
         requirements = {name: set() for name in self._selected}
         if self._runtime is not None:
@@ -285,24 +424,50 @@ class RecoverySession:
         dependencies = {name: {provider for _, provider in reqs if provider not in {name, None, ROUTER_PROVIDER}}
                         for name, reqs in requirements.items()}
 
-        # The router clones private Git through OAuth; those dependencies are not
-        # in app grants. Do not create an OAuth -> bootstrap-provider -> OAuth
-        # cycle: OAuth and its ancestors may themselves need a public/bootstrap
-        # source or external authorization before their private data is usable.
-        oauth = defaults.get(OAUTH_SERVICE)
+        # Retained providers may depend on other destination apps. Resolve those
+        # grants against the defaults recovery will establish, so early startup
+        # cannot cache an old provider selection. Unrelated consumers stay paused.
+        destination_defaults = {p["service_url"]: p["app_name"] for p in destination_providers if p["is_default"]}
+        destination_defaults.update(defaults)
+        names = {app["app_id"]: name for name, app in self._baseline.items()}
+        names[ROUTER_PROVIDER] = ROUTER_PROVIDER
+        external = {name: set() for name in self._baseline if name not in self._selected}
+        self._external_services = {name: set() for name in external}
+        for grant in destination_permissions:
+            consumer = names.get(grant["consumer_app_id"])
+            if consumer not in external:
+                continue
+            if grant["scope"] == "global":
+                self._external_services[consumer].add(grant["service_url"])
+            provider = (destination_defaults.get(grant["service_url"]) if grant["scope"] == "global"
+                        else names.get(grant["provider_app_id"]))
+            if provider not in {None, consumer, ROUTER_PROVIDER}:
+                external[consumer].add(provider)
+        self._external_dependencies = external
+        for name, required in dependencies.items():
+            pending, seen = list(required), set()
+            while pending:
+                provider = pending.pop()
+                if provider in seen:
+                    continue
+                seen.add(provider)
+                if provider in self._selected:
+                    required.add(provider)
+                else:
+                    pending.extend(external.get(provider, ()))
+
+        # Prefer OAuth and its prerequisites when they are part of this recovery,
+        # so private clones can use them. This is an ordering preference, never
+        # a requirement: the router tries anonymous cloning first, and a public
+        # repository must not depend on an unrelated/unavailable OAuth provider.
+        oauth = self._clone_oauth
         ancestors = set()
         pending = [oauth] if oauth is not None else []
         while pending:
             name = pending.pop()
             if name not in ancestors:
                 ancestors.add(name)
-                pending.extend(dependencies.get(name, set()) - ancestors)
-        if oauth is not None:
-            for name in self._selected:
-                if self._plans[name]["status"] == "ready" and self._definition_apps[name]["source"]["kind"] == "remote" and name not in ancestors:
-                    requirements[name].add((OAUTH_SERVICE, oauth))
-                    if oauth not in {name, ROUTER_PROVIDER}:
-                        dependencies[name].add(oauth)
+                pending.extend((dependencies.get(name, set()) | external.get(name, set())) - ancestors)
         self._requirements = requirements
         remaining = set(self._selected)
         order = []
@@ -310,7 +475,7 @@ class RecoverySession:
             ready = [name for name in remaining if not dependencies[name] & remaining]
             if not ready:
                 break
-            name = min(ready, key=lambda n: (n not in provider_names, n))
+            name = min(ready, key=lambda n: (n not in ancestors, n not in provider_names, n))
             remaining.remove(name)
             order.append(name)
         self._order, self._cycles = order, remaining
@@ -356,10 +521,10 @@ class RecoverySession:
                 plans = self._parse_plan(plan, inventory)
                 self._check_existing_configuration(document, inventory, plans)
                 providers = _providers(await self._client.get("/api/services/v2"), inventory)
-                if self._runtime is not None:
-                    _permissions(await self._client.get("/api/permissions/v2"))
+                self._clone_oauth = next((p["app_name"] for p in providers if p["service_url"] == OAUTH_SERVICE and p["is_default"]), None)
+                permissions = _permissions(await self._client.get("/api/permissions/v2"))
                 self._baseline, self._plans = inventory, plans
-                self._build_dependencies(providers)
+                self._build_dependencies(providers, permissions)
                 for name in self._selected:
                     app = plans[name]
                     self._apps[name].update(plan_status=app["status"], app_id=app.get("app_id"),
@@ -635,7 +800,20 @@ class RecoverySession:
                 if name not in self._ready:
                     raise ConfigurationError("provider_unavailable")
             elif name in self._paused:
-                await self._resume_unaffected(name)
+                # Start this provider's retained prerequisite group together,
+                # keeping unrelated consumers paused until defaults are restored.
+                self._start_unaffected(name)
+                task = self._resume_tasks.get(name)
+                while task is not None:
+                    await asyncio.shield(task)
+                    # An early attempt may have failed before a selected
+                    # prerequisite activated. Retry at most once per changed
+                    # activation generation, before failing this consumer too.
+                    self._start_unaffected(name)
+                    current = self._resume_tasks.get(name)
+                    if current is task:
+                        break
+                    task = current
         deadline = asyncio.get_running_loop().time() + self._deployment_timeout
         while True:
             inventory = _inventory(await self._get_before_deadline("/api/apps", deadline))
@@ -667,6 +845,50 @@ class RecoverySession:
         if not provider["is_default"]:
             raise ConfigurationError("provider_unavailable")
         self._defaults_done.add((service, name))
+        self._blocked_defaults.discard(service)
+
+    async def _prime_retained_defaults(self) -> None:
+        """Select registered retained providers while their consumers are stopped.
+
+        The router permits selecting a stopped registered provider. Readiness is
+        still required later, before the selection counts as recovered.
+        """
+        saved = [p for p in self._provider_specs if p["is_default"] and p["app_name"] not in self._selected]
+        if not saved:
+            return
+        self._blocked_defaults.update(p["service_url"] for p in saved)
+        inventory = _inventory(await self._client.get("/api/apps"))
+        self._check_quiescent(inventory)
+        try:
+            providers = _providers(await self._client.get("/api/services/v2"), inventory)
+        except ConfigurationError:
+            self._warn(_DEFAULT_FAILED)
+            return  # unknown selections stay blocked; independent apps can recover
+        expected = {}
+        for provider in saved:
+            name, service = provider["app_name"], provider["service_url"]
+            app_id = ROUTER_PROVIDER if name == ROUTER_PROVIDER else self._baseline.get(name, {}).get("app_id")
+            current = next((p for p in providers if p["app_name"] == name and p["service_url"] == service and p["app_id"] == app_id), None)
+            if current is None:
+                continue
+            expected[service] = app_id
+            if not current["is_default"]:
+                try:
+                    _require_ok(await self._client.post("/api/services/v2/defaults", {"service_url": service, "app_id": app_id}))
+                except ConfigurationError:
+                    pass  # readback reconciles lost replies; refusal blocks consumers
+        inventory = _inventory(await self._client.get("/api/apps"))
+        self._check_quiescent(inventory)
+        try:
+            actual = {p["service_url"]: p["app_id"] for p in _providers(await self._client.get("/api/services/v2"), inventory) if p["is_default"]}
+        except ConfigurationError:
+            self._warn(_DEFAULT_FAILED)
+            return
+        for service, app_id in expected.items():
+            if actual.get(service) == app_id:
+                self._blocked_defaults.discard(service)
+        if self._blocked_defaults:
+            self._warn(_DEFAULT_FAILED)
 
     async def _ensure_requirements(self, name: str) -> None:
         for service, provider in sorted(self._requirements[name], key=lambda pair: (pair[0], pair[1] or "")):
@@ -701,6 +923,23 @@ class RecoverySession:
                 await self._reload(name, app_id)
             else:
                 result["action"] = "install"
+                source = self._definition_apps[name]["source"]
+                oauth = self._clone_oauth
+                if (source["kind"] == "remote" and urlsplit(source["repo_url"]).hostname == "github.com"
+                        and oauth in self._paused and oauth not in self._selected
+                        and self._paused[oauth]["previous_status"] == "running" and self._clone_bootstrap_remaining > 0):
+                    # Best-effort bootstrap of the destination's own GitHub
+                    # authentication, with one shared request-sized budget.
+                    # Failure must still allow anonymous cloning; the owned
+                    # restart task is settled later in final cleanup.
+                    started = asyncio.get_running_loop().time()
+                    try:
+                        async with asyncio.timeout(self._clone_bootstrap_remaining):
+                            await self._provider_ready(OAUTH_SERVICE, oauth)
+                    except (ConfigurationError, TimeoutError):
+                        pass
+                    finally:
+                        self._clone_bootstrap_remaining = max(0, self._clone_bootstrap_remaining - (asyncio.get_running_loop().time() - started))
                 self._count_launch(name)
                 app_id = await self._install(name)
             result.update(app_id=app_id, status="running", outcome="restored", ok=True)
@@ -708,6 +947,7 @@ class RecoverySession:
             # Only an app this recovery actually started may have its recorded
             # stopped state reapplied during cleanup.
             self._activated.add(name)
+            self._activation_generation += 1
             # Registration is part of readiness for a captured provider, even
             # when no other selected app currently consumes its service.
             for provider in self._provider_specs:
@@ -843,6 +1083,8 @@ class RecoverySession:
                 self._warn(_DEFAULT_FAILED)
         self._completion_confirmed = True
         self._warnings = [warning for warning in self._warnings if warning != _FINAL_UNCONFIRMED]
+        if len(self._defaults_done) == sum(p["is_default"] for p in self._provider_specs):
+            self._warnings = [warning for warning in self._warnings if warning != _DEFAULT_FAILED]
         if not self._cleanup_failed:
             self._warnings = [warning for warning in self._warnings if warning != _CLEANUP_FAILED]
 
@@ -854,6 +1096,7 @@ class RecoverySession:
             try:
                 self._check_quiescent(_inventory(await self._client.get("/api/apps")))
                 await drain(self._import_tokens())  # first write; exact same canonical content
+                await drain(self._prime_retained_defaults())
                 for name in self._cycles:
                     self._apps[name].update(outcome="blocked", ok=False)
                 for name in self._order:
@@ -883,29 +1126,63 @@ class RecoverySession:
                 self._current_app = None
             return self.progress
 
-    async def _restart_all(self) -> None:
+    def _start_unaffected(self, provider: str | None = None) -> None:
+        """Own each restart task through final cleanup, including cancellation."""
         async def resume(name: str, paused: dict) -> None:
             try:
+                if any(self._external_services.get(member, set()) & self._blocked_defaults for member in components[name]):
+                    raise ConfigurationError("provider_unavailable")
+                for dependency in prerequisites[name]:
+                    task = self._resume_tasks.get(dependency)
+                    if task is not None:
+                        await asyncio.shield(task)
+                        if self._paused[dependency]["restart"] != "confirmed":
+                            raise ConfigurationError("provider_unavailable")
                 await self._resume_unaffected(name)
             except ConfigurationError:
                 paused["restart"] = "failed"
                 self._warn(_CLEANUP_FAILED)
 
-        pending = [(name, paused) for name, paused in self._paused.items()
-                   if not paused["selected"] and paused["previous_status"] == "running" and paused["restart"] != "confirmed"]
-        if pending:
-            # Resumes run together so a consumer never waits on a provider that
-            # happens to sort later; the router owns the actual start order.
-            async def resume_all() -> list:
-                return await asyncio.gather(
-                    *(resume(name, paused) for name, paused in pending), return_exceptions=True)
+        group = set(self._paused) if provider is None else set()
+        pending = [] if provider is None else [provider]
+        while pending:
+            name = pending.pop()
+            if name in group:
+                continue
+            group.add(name)
+            if name in self._selected:
+                if name not in self._ready:
+                    raise ConfigurationError("provider_unavailable")
+            else:
+                pending.extend(self._external_dependencies.get(name, ()))
+        prerequisites, components = _restart_prerequisites({name: self._external_dependencies.get(name, set()) & group for name in group})
+        for name, paused in self._paused.items():
+            if name not in group:
+                continue
+            if not paused["selected"] and paused["previous_status"] == "running" and paused["restart"] != "confirmed":
+                task = self._resume_tasks.get(name)
+                changed = (task is not None and task.done() and not task.cancelled() and task.exception() is None
+                           and self._resume_generation[name] < self._activation_generation)
+                if task is None or changed:
+                    self._resume_generation[name] = self._activation_generation
+                    self._resume_tasks[name] = asyncio.create_task(resume(name, paused))
 
-            self._current_app = None
-            results = await drain(resume_all())
-            self._current_app = None
-            for result in results:
-                if isinstance(result, BaseException) and not isinstance(result, ConfigurationError):
-                    raise result
+    async def _restart_all(self) -> None:
+        async def settle() -> list:
+            return await asyncio.gather(*self._resume_tasks.values(), return_exceptions=True)
+
+        self._current_app = None
+        # Earlier activation may have resumed providers and their prerequisites.
+        # Settle those tasks, then retry failures now that selected providers are
+        # available. Never issue a duplicate reload while a worker is in flight.
+        results = await drain(settle()) if self._resume_tasks else []
+        self._resume_tasks.clear()
+        self._start_unaffected()
+        results.extend(await drain(settle()))
+        self._resume_tasks.clear()
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(result, ConfigurationError):
+                raise result
         await drain(self._apply_saved_stopped_states())
         self._cleanup_failed = any(not p["selected"] and p["previous_status"] == "running" and p["restart"] != "confirmed"
                                    for p in self._paused.values())
@@ -913,6 +1190,34 @@ class RecoverySession:
             self._warnings = [warning for warning in self._warnings if warning != _CLEANUP_FAILED]
         if self._activation_finished:
             await self._validate_completion()
+
+    async def confirm_source_cutover(self) -> bool:
+        """Verify source identities/states after cleanup, without activation.
+
+        Source sessions only pause apps. Destination activation's completion
+        checks therefore cannot establish that the source is safe to cut over.
+        """
+        async with self._lock:
+            self._source_cutover_confirmed = False
+            try:
+                inventory = _inventory(await self._client.get("/api/apps"))
+                self._check_identities(inventory)
+            except ConfigurationError:
+                self._warn(_FINAL_UNCONFIRMED)
+                return False
+            valid = True
+            for name, before in self._baseline.items():
+                if name == self._backup_app_name:
+                    continue
+                expected = "running" if name not in self._selected and before["status"] == "running" else "stopped"
+                matches = inventory[name]["status"] == expected
+                valid = valid and matches
+                if name in self._paused and not self._paused[name]["selected"] and before["status"] == "running":
+                    self._paused[name]["restart"] = "confirmed" if matches else "failed"
+                if not matches:
+                    self._warn(_FINAL_UNCONFIRMED)
+            self._source_cutover_confirmed = valid
+            return valid
 
     async def restart_unaffected(self) -> dict:
         """Finally-block cleanup: resume only our paused, unselected running apps.

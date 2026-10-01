@@ -75,7 +75,7 @@ async def receiver(environment, monkeypatch, mock_http):
 
 async def start(env):
     result = await env.peer.request("POST", "/api/migration/receive/start", body={
-        "version": 5, "bundle": env.bundle, "password": env.password})
+        "version": 5, "bundle": env.bundle, "password": env.password, "capture_complete": True})
     return result["session_id"]
 
 
@@ -176,10 +176,38 @@ async def test_invalid_or_incomplete_recovery_never_succeeds(receiver, tmp_path,
 @pytest.mark.parametrize("version", [None, 3, 4, 5.0, True])
 async def test_old_or_invalid_protocol_fails_before_changes(receiver, version):
     response = await receiver.client.post("/api/migration/receive/start", json={
-        "version": version, "bundle": receiver.bundle, "password": receiver.password},
+        "version": version, "bundle": receiver.bundle, "password": receiver.password, "capture_complete": True},
         headers={"Authorization": "Bearer " + OWNER_TOKEN})
     assert response.status_code == 400
     assert not receiver.router.mutations() and not backup_app.op_lock.busy
+
+
+async def test_older_v5_source_is_rejected_before_receiving(receiver):
+    response = await receiver.client.post("/api/migration/receive/start", json={
+        "version": 5, "bundle": receiver.bundle, "password": receiver.password},
+        headers={"Authorization": "Bearer " + OWNER_TOKEN})
+    assert response.status_code == 400
+    assert not receiver.router.mutations() and not backup_app.op_lock.busy
+
+
+async def test_older_v5_receiver_is_rejected_before_source_capture(receiver, monkeypatch):
+    peer = receiver.peer
+    request = peer.request
+    async def old_receiver(method, path, **kwargs):
+        result = await request(method, path, **kwargs)
+        if path.endswith("/capabilities"):
+            result.pop("capture_complete")
+        return result
+    peer.request = old_receiver
+    monkeypatch.setattr(m, "_Peer", lambda *args: peer)
+    capture = AsyncMock(side_effect=AssertionError("Must negotiate before capturing or stopping apps"))
+    monkeypatch.setattr(m, "capture_configuration", capture)
+    lock = OperationLock()
+    assert not await m.run_direct_push(target_url="https://destination.test", target_token=OWNER_TOKEN,
+        selected_apps=["demo"], lock=lock, all_app_data=receiver.root, work_dir=receiver.root / "backup" / ".source",
+        router_url=ORIGIN, app_token="synthetic", owner_token=OWNER_TOKEN)
+    capture.assert_not_awaited()
+    assert not lock.busy and not receiver.router.mutations()
 
 
 @pytest.mark.parametrize("endpoint,method", [("capabilities", "GET"), ("start", "POST"),
@@ -251,9 +279,22 @@ async def test_idle_expiry_and_restart_notice(receiver):
         work_dir=env.root / "backup" / ".migration", router_url=ORIGIN, restore=env.receiver.restore)
     assert restarted.needs_attention and restarted.journal_status["phase"] == "interrupted"
     with pytest.raises(m.MigrationError, match="inspection"):
-        await restarted.start({"version": 5, "bundle": env.bundle, "password": env.password}, owner_token=OWNER_TOKEN)
+        await restarted.start({"version": 5, "bundle": env.bundle, "password": env.password, "capture_complete": True}, owner_token=OWNER_TOKEN)
     await restarted.acknowledge(owner_token=OWNER_TOKEN)
     assert not restarted.needs_attention
+
+
+async def test_latest_incoming_abort_supersedes_older_outgoing_success(receiver, monkeypatch):
+    env = receiver
+    monkeypatch.setattr(m, "status", {"phase": "done", "ok": True, "started_at": 1})
+    sid = await start(env)
+    await env.receiver.abort({"version": 5, "session_id": sid}, owner_token=OWNER_TOKEN)
+    result = await (await env.client.get("/api/migration/status")).get_json()
+    assert result["status"]["phase"] == "error" and not result["receive"]["needs_attention"]
+    # A subsequent outgoing success then legitimately supersedes that history.
+    m.status = {"phase": "done", "ok": True, "started_at": env.receiver.journal_status["started_at"] + 1}
+    result = await (await env.client.get("/api/migration/status")).get_json()
+    assert result["status"]["phase"] == "done"
 
 
 @pytest.mark.parametrize("fault", ["preflight", "journal"])
@@ -264,7 +305,7 @@ async def test_start_failure_releases_lock_and_empty_repository(receiver, monkey
     else:
         monkeypatch.setattr(env.receiver, "_save", lambda: (_ for _ in ()).throw(OSError("failed publication")))
     with pytest.raises((OSError, RuntimeError)):
-        await env.receiver.start({"version": 5, "bundle": env.bundle, "password": env.password}, owner_token=OWNER_TOKEN)
+        await env.receiver.start({"version": 5, "bundle": env.bundle, "password": env.password, "capture_complete": True}, owner_token=OWNER_TOKEN)
     assert not backup_app.op_lock.busy and not env.router.mutations()
     assert not list(env.receiver.work.glob("[a-f0-9]" * 64))
     assert env.receiver.journal_status is None or env.receiver.journal_status["phase"] == "aborted"
@@ -351,7 +392,7 @@ async def test_receiving_restart_reclaims_disposable_repository(receiver):
     restarted = m.MigrationReceiver(lock=backup_app.op_lock, all_app_data=env.root,
         work_dir=env.root / "backup" / ".migration", router_url=ORIGIN, restore=env.receiver.restore)
     assert not restarted.needs_attention
-    next_session = await restarted.start({"version": 5, "bundle": env.bundle, "password": env.password}, owner_token=OWNER_TOKEN)
+    next_session = await restarted.start({"version": 5, "bundle": env.bundle, "password": env.password, "capture_complete": True}, owner_token=OWNER_TOKEN)
     assert not (restarted.work / sid).exists()
     await restarted.abort({"version": 5, "session_id": next_session["session_id"]}, owner_token=OWNER_TOKEN)
     env.receiver._record = None  # the old process is gone
@@ -366,6 +407,26 @@ async def test_corrupt_journal_acknowledgment_survives_restart(receiver):
     assert restarted.needs_attention
     await restarted.acknowledge(owner_token=OWNER_TOKEN)
     assert not m.MigrationReceiver(**kwargs).needs_attention
+
+
+@pytest.mark.parametrize("direction", ["source", "incoming"])
+async def test_acknowledgment_response_distinguishes_success_from_failed_job(receiver, monkeypatch, direction):
+    env = receiver
+    if direction == "source":
+        record = m.SourceRecoveryRecord(lock=backup_app.op_lock, all_app_data=env.root,
+            work_dir=env.root / "backup" / ".source", router_url=ORIGIN)
+        record.begin("b" * 64, {"demo"}, [inventory_entry("demo", "D" * 12)], "backup")
+        monkeypatch.setattr(m, "source_recovery", record)
+        path = "/api/migration/source-acknowledge"
+    else:
+        record = env.receiver
+        record._record = {"version": 5, "session_id": "b" * 64, "phase": "incomplete", "ok": False, "needs_attention": True}
+        path = "/api/migration/acknowledge"
+    response = await env.client.post(path, headers={"Authorization": "Bearer " + OWNER_TOKEN})
+    body = await response.get_json()
+    assert response.status_code == 200 and body["ok"] is True
+    assert not record.needs_attention and body["needs_attention"] is False
+    assert body["journal_status"]["ok"] is False
 
 
 @pytest.mark.parametrize("both_layouts", [False, True])
@@ -411,7 +472,7 @@ async def test_peer_request_has_a_total_deadline(mock_http, monkeypatch):
         await asyncio.wait_for(m._Peer("https://destination.test", OWNER_TOKEN).request("POST", "/api/migration/receive/abort"), 1)
 
 
-@pytest.mark.parametrize("fault", [None, "lost-upload", "lost-finalize", "transfer", "resume", "resume-error", "cancel", "receiver-restart"])
+@pytest.mark.parametrize("fault", [None, "lost-upload", "lost-finalize", "transfer", "resume", "resume-error", "final-state", "cancel", "receiver-restart"])
 async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeypatch, fault):
     env = receiver
     captured = make_bundle("demo", "other", "backup", runtime=True)
@@ -428,8 +489,11 @@ async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeyp
             events.append("cleanup")
             if fault == "resume-error":
                 raise RuntimeError("restart failed")
-            return {"paused_apps": [{"name": "other", "selected": False, "previous_status": "running",
+            self.progress = {"paused_apps": [{"name": "other", "selected": False, "previous_status": "running",
                                      "restart": "failed" if fault == "resume" else "confirmed"}]}
+            return self.progress
+        async def confirm_source_cutover(self):
+            return fault != "final-state"
     factory = m.RecoverySession
     monkeypatch.setattr(m, "RecoverySession", lambda url, *args: Source() if url == "https://source.test" else factory(url, *args))
     monkeypatch.setattr(m, "capture_configuration", AsyncMock(return_value=captured))
@@ -470,7 +534,7 @@ async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeyp
         result = False
     else:
         result = await operation
-    assert result == (fault not in {"transfer", "resume", "resume-error", "cancel", "receiver-restart"}), m.status
+    assert result == (fault not in {"transfer", "resume", "resume-error", "final-state", "cancel", "receiver-restart"}), m.status
     assert events == ["preflight", "stopped", "cleanup"]
     assert not source_lock.busy and not m.source_recovery.live
     assert m.source_recovery.needs_attention == (not result)

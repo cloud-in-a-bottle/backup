@@ -104,6 +104,10 @@ Each successful backup creates a restic snapshot tagged with `bottle`. Older sna
 
 Select a snapshot and expand its contents summary to see which files and settings were captured. Legacy snapshots remain usable but cannot recreate missing app definitions or API keys.
 
+Whole-app recovery requires a `bottle-capture-complete-v1` tag, published in the repository only after restic finishes a successful capture. Failed or interrupted captures can still leave partial snapshots; these are labeled unconfirmed and cannot replace app trees. Configuration snapshots made before completion tracking also require file-only recovery. Their captured files remain available through a root-specific API restore. This check works on a new instance without the source's backup history.
+
+The completion rewrite also records the original capture ID. Append-only repositories may retain the unconfirmed predecessor; recovery verifies the completed snapshot independently, without requiring deletion permission.
+
 The browser groups stored paths under these folder names, including for existing snapshots. The original filesystem tree remains available through `/api/snapshot/files`; `view=backup` returns the grouped top level with each entry's original `browse_path` for navigation.
 
 The Status panel shows the **repo size**, the deduplicated, compressed on-disk footprint (`restic stats --mode raw-data`). Because computing it is slow on large/remote repos, the value is cached: it is recomputed and stored after each backup and after a snapshot delete/prune, and served from the cache on page load. The backup history database is reconciled against restic on every snapshot listing, so rows for snapshots that no longer exist are cleaned up automatically.
@@ -113,6 +117,8 @@ The Status panel shows the **repo size**, the deduplicated, compressed on-disk f
 The UI always requests a full snapshot restore, regardless of the root open in the file browser. Configuration-aware recovery requires the **caller** to be the owner: paste a valid owner Router API Token in the Backups tab (or send it as a Bearer token) and the backup app confirms it with the router before starting. The token saved in the app's own configuration authorizes unattended backups; it never authorizes a caller, because co-located containers can reach this app directly. Legacy files-only restores keep their existing behavior. Recovery preflights definitions, stages and verifies data before stopping apps, and replaces whole selected app trees so stale files and database WALs are removed. It imports API-key records additively, restores providers and global grants before consumers, waits for application readiness and resumes unaffected apps. An accepted request is not a completed restore.
 
 Existing selected apps must have the same source and published ports as the snapshot. Conflicts fail preflight; reconcile or remove the conflicting app, or recover onto a fresh destination. Existing apps reload saved/local code with `update:false`, rather than fetching an update. Both existing and newly installed selected apps start during recovery, and saved stopped states are reapplied only after unaffected apps are running, so a consumer never needs an app that is recorded stopped. Intentionally stopped apps can run while other apps become ready. Private sources may need bootstrap authorization. Provider-scoped OAuth grants require manual reauthorization and make recovery incomplete. Owner passwords, sessions and platform settings are not restored.
+
+Private GitHub clones use a recovered OAuth selection when it is in scope, otherwise the destination's configured OAuth provider. A remote repository alone does not bring an unselected source OAuth provider into migration scope. Public clones do not require that provider, and optional authorization bootstrap shares a bounded wait across the recovery.
 
 Restored files keep their recorded modes, including private `0000` files and `0500` trees. Durability is established while a restored entry is still reachable, and each rename is flushed through the directory that holds it, so a legitimately unreadable tree is never reopened to justify discarding the originals.
 
@@ -128,7 +134,7 @@ The "Run restic check" button runs `restic check`, which verifies the internal c
 
 ## Migration
 
-The Migrate tab moves selected apps, persistent data, private definitions, API-key records, desired states, exact global service grants and provider selections to another instance. Both backup apps must be upgraded to protocol v5. Older receivers are rejected before side effects.
+The Migrate tab moves selected apps, persistent data, private definitions, API-key records, desired states, exact global service grants and provider selections to another instance. Both backup apps must support protocol v5 and negotiate confirmed-capture support. Older peers are rejected before source apps are paused.
 
 ### How migration works
 
@@ -268,7 +274,7 @@ Every restic invocation is logged (the command on start, exit code and elapsed t
 
 ## Running tests
 
-Install restic 0.19.1 on `PATH`, then install the locked development dependencies and matching Chromium:
+Install restic 0.19.1 on `PATH` (also pinned in the production image), then install the locked development dependencies and matching Chromium:
 
 ```sh
 uv sync --frozen --group dev

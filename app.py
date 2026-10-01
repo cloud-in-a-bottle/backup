@@ -10,6 +10,7 @@ import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 from quart import Quart, Response, jsonify, render_template, request
 
@@ -20,7 +21,7 @@ import snapshot_configuration
 from configuration import (ConfigurationError, RouterClient, _inventory, capture_configuration,
                         confirm_owner)
 from operations import OperationLock, OpKind, drain
-from recovery import RecoverySession
+from recovery import RecoverySession, journal_progress
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ SNAPSHOT_TAGS = (SNAPSHOT_TAG, LEGACY_SNAPSHOT_TAG)
 
 
 def _zone_tag() -> str | None:
-    return f"zone:{ZONE_DOMAIN}" if ZONE_DOMAIN else None
+    return f"zone:{quote(ZONE_DOMAIN, safe='.-:')}" if ZONE_DOMAIN else None
 
 
 def _restic_tag_args() -> list[str]:
@@ -154,14 +155,23 @@ def _has_app_tag(tags: list[str]) -> bool:
 
 
 def _backup_tags(name: str | None = None) -> list[str]:
-    """Tags on a new snapshot: ``bottle``, optional zone, optional ``name:``."""
+    """Encode user components: restic splits every --tag value on commas."""
     tags = [SNAPSHOT_TAG]
     zone = _zone_tag()
     if zone:
         tags.append(zone)
     if name:
-        tags.append(f"name:{name}")
+        tags.append(f"name-uri:{quote(name, safe='')}")
     return tags
+
+
+def _snapshot_name(tags: list[str]) -> str | None:
+    for tag in tags:
+        if tag.startswith("name-uri:"):
+            return unquote(tag[len("name-uri:"):])
+        if tag.startswith("name:"):
+            return tag[len("name:"):]
+    return None
 
 
 def classify_repo(repo: str) -> dict:
@@ -820,28 +830,34 @@ async def test_restic_connection(
 
     async def read_stderr() -> None:
         assert proc.stderr is not None
-        while True:
-            chunk = await proc.stderr.read(4096)
-            if not chunk:
-                return
-            buf.extend(chunk)
+        try:
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    return
+                buf.extend(chunk)
+        except BaseException:
+            restic_process.abort_failed_reader(proc, proc.stderr)
+            raise
 
-    stderr_task = asyncio.create_task(read_stderr())
+    async def collect() -> None:
+        # This task is the sole owner of the pipe, including timeout/cancellation
+        # cleanup. A second drain cannot read the same StreamReader concurrently.
+        results = await asyncio.gather(read_stderr(), proc.wait(), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    communication = asyncio.create_task(collect())
     timed_out = False
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
-        restic_process.kill_group(proc)
-    if timed_out:
-        # Reaping the whole group also drains the pipe to EOF, which is what
-        # unpauses a full pipe transport; nothing of restic's outlives this
-        # request, not even an SSH or rclone helper it started.
-        await restic_process.kill_and_drain(proc)
-    try:
-        await asyncio.wait_for(stderr_task, timeout=2)
-    except asyncio.TimeoutError:
-        stderr_task.cancel()
+    finally:
+        if proc.returncode is None or not communication.done():
+            restic_process.kill_group(proc)
+        await restic_process.finish_communication(communication)
 
     text = bytes(buf).decode(errors="replace")
     if timed_out:
@@ -1045,6 +1061,10 @@ async def run_backup(name: str | None = None, *, lock_acquired: bool = False) ->
                     logger.info("restic stderr: %s", line)
 
         if rc == 0:
+            snapshot_id = await snapshot_configuration.complete_capture(
+                (summary or {}).get("snapshot_id"), _restic_env(conf)
+            )
+            summary["snapshot_id"] = snapshot_id
             # Backup succeeded. Apply the retention policy first (forget only,
             # under the lock) so the footprint we stamp reflects the
             # post-retention snapshot set. Best-effort — a retention failure
@@ -1159,8 +1179,10 @@ async def list_snapshots() -> tuple[list[dict], bool]:
                     "paths": e.get("paths", []),
                     "tags": tags,
                     "hostname": e.get("hostname", ""),
+                    "name": _snapshot_name(tags),
                     "has_configuration": snapshot_configuration.CONFIGURATION_TAG in tags,
                     "has_runtime": snapshot_configuration.RUNTIME_TAG in tags,
+                    "capture_complete": snapshot_configuration.is_complete_capture(e),
                 }
             )
         # Newest first
@@ -1833,11 +1855,12 @@ def _load_restore_journal() -> None:
             raise ValueError
         active = saved["phase"] not in {"complete", "incomplete", "error", "acknowledged", "interrupted"}
         pending_restarts = _pending_restart_records(saved, infer_interrupted=active)
+        recovery = journal_progress(saved.get("recovery"))
         _restore_needs_attention = bool(saved.get("needs_attention")) or active or bool(pending_restarts)
         restore_progress = {
             "journal_version": 1, "snapshot": saved["snapshot"], "job_id": saved["job_id"],
             "phase": "interrupted" if active else saved["phase"],
-            "needs_attention": _restore_needs_attention, "recovery": None,
+            "needs_attention": _restore_needs_attention, "recovery": recovery,
             "affected_apps": saved.get("affected_apps", []),
             "affected_roots": saved.get("affected_roots", []),
             "retained_stages": retained,
@@ -1880,6 +1903,10 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
     if not owner_token:
         raise snapshot_configuration.SnapshotConfigurationError(
             "Configuration recovery requires owner authorization from the caller."
+        )
+    if not snapshot.capture_complete:
+        raise snapshot_configuration.SnapshotConfigurationError(
+            "This snapshot has no confirmed complete capture. Use file-only recovery or select a completed backup."
         )
     allowed = {str(path) for path in BACKUP_ROOTS} | {str(snapshot_configuration.CONFIGURATION_FILE)}
     if any(path not in allowed for path in snapshot.paths):
@@ -2027,9 +2054,10 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
                 _checkpoint_restore(final_phase, needs_attention=needs_attention)
             except Exception:
                 logger.error("Final recovery progress could not be persisted", exc_info=True)
-                # An unreliable journal must not be papered over: anything this
-                # run modified keeps the recovery gated for owner inspection.
-                if needs_attention or modifying or committed:
+                # After the durable complete checkpoint, this publication only
+                # records garbage collection. Its failure cannot undo the commit
+                # or tell the source that a confirmed migration is incomplete.
+                if not committed and (needs_attention or modifying):
                     _restore_needs_attention = True
             _restore_session = None
     try:
@@ -2106,9 +2134,8 @@ async def run_restore(snapshot_id: str, root: str | None = None, owner_token: st
     With ``root`` None a snapshot that carries configuration is recovered
     through the owner-only configuration path, which needs ``owner_token``
     confirmed by the router. A configuration snapshot requested with a named
-    root, or one whose caller is not the owner, degrades to a file-only
-    restore that writes captured files in place and applies no definitions,
-    API keys or app state.
+    root uses file-only restore, applying no definitions, API keys or app state.
+    Whole-snapshot configuration recovery refuses callers without owner authority.
 
     A named root (``app_data``, ``app_temp_data``, or the legacy ``vm_data``)
     is selected with restic ``--exclude`` filters for the other captured
@@ -3128,7 +3155,8 @@ async def migration_status_endpoint():
     if incoming and incoming.get("snapshot") == (restore_progress or {}).get("snapshot") and incoming.get("snapshot"):
         incoming["recovery"] = _restore_session.progress if _restore_session else restore_progress.get("recovery")
     displayed = migration.status
-    if incoming and (displayed is None or incoming.get("phase") in {"preflighting", "receiving", "finalizing"}):
+    incoming_newer = incoming and incoming.get("started_at", 0) > (displayed or {}).get("started_at", 0)
+    if incoming and (displayed is None or incoming_newer or incoming.get("phase") in {"preflighting", "receiving", "finalizing"}):
         phase = incoming.get("phase", "interrupted")
         displayed = {
             "phase": "done" if phase == "complete" else "error" if phase in {"failed", "incomplete", "interrupted", "aborted"} else phase,
@@ -3346,7 +3374,7 @@ async def migration_acknowledge():
         if response.status_code != 200:
             return response
     state = await _receiver().acknowledge(owner_token=token)
-    return jsonify(state if type(state) is dict else {"ok": True, "needs_attention": False})
+    return jsonify(ok=True, needs_attention=False, journal_status=state)
 
 
 @route("/api/migration/source-acknowledge", methods=["POST"])
@@ -3359,7 +3387,7 @@ async def migration_source_acknowledge():
     if record is None:
         return jsonify(ok=True, needs_attention=False, journal_status=None)
     state = await record.acknowledge(owner_token=token)
-    return jsonify(state if type(state) is dict else {"ok": True, "needs_attention": False})
+    return jsonify(ok=True, needs_attention=False, journal_status=state)
 
 
 @route("/api/migration/receive/abort", methods=["POST"])

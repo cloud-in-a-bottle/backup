@@ -44,3 +44,8 @@ jobs:
         run: |
           restic version
           uv run --frozen --group dev pytest tests/ -v
+
+      - name: Verify production image
+        run: |
+          docker build --tag backup:test .
+          docker run --rm backup:test restic version

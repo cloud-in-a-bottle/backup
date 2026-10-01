@@ -112,6 +112,7 @@ class MockAPI:
         self.owner_required = False
         self.reject_owner = False
         self.auth = []
+        self.capture_complete = True
 
     OWNER_REQUIRED = "Owner authorization required: send a valid owner Router API token as a Bearer token."
     OWNER_ACTIONS = frozenset({
@@ -188,7 +189,8 @@ class MockAPI:
             "migration/status": self.migration,
             "snapshots": {"ok": True, "repo_ok": True, "snapshots": [
                 {"id": ident, "short_id": ident[:8], "time": "2026-09-29T10:00:00Z",
-                 "hostname": "source.example", "has_configuration": conf, "has_runtime": runtime}
+                 "hostname": "source.example", "has_configuration": conf, "has_runtime": runtime,
+                 "capture_complete": self.capture_complete}
                 for ident, conf, runtime in [(SNAPSHOT, True, True), (LIMITED, True, False), (LEGACY, False, False)]
             ]},
             "history": {"ok": True, "history": []},
@@ -451,6 +453,31 @@ async def test_migration_validation_and_confirmed_completion(browser_ui):
     api.migration.update(running=False, status={"phase": "done", "progress": 100})
     await expect(page.locator("#mig-state")).to_contain_text("cleanup confirmed")
     await expect(page.locator("#mig-msg")).to_contain_text("without credentials")
+
+
+@pytest.mark.parametrize("phase", ["aborted", "interrupted"])
+async def test_historical_incoming_record_does_not_hide_outgoing_success(browser_ui, phase):
+    page, api = browser_ui
+    await page.get_by_role("button", name="Migrate", exact=True).click()
+    api.migration.update(status={"phase": "done"}, source_recovery={"ok": True, "needs_attention": False},
+        receive={"phase": phase, "ok": False, "result": {"ok": False}, "needs_attention": False,
+                 "acknowledged": phase == "interrupted"})
+    await expect(page.locator("#mig-state")).to_contain_text("cleanup confirmed")
+    await expect(page.locator("#mig-details")).to_contain_text(phase)
+    api.migration["receive"]["needs_attention"] = True
+    await expect(page.locator("#mig-state")).to_contain_text("incomplete or failed")
+
+
+async def test_unconfirmed_capture_is_browsable_but_cannot_replace_apps(browser_ui):
+    page, api = browser_ui
+    api.capture_complete = False
+    await page.get_by_role("button", name="Refresh snapshots").click()
+    await select_snapshot(page)
+    await expect(page.locator("#selected-snapshot-contents")).to_have_text("Capture incomplete or unconfirmed")
+    await expect(page.locator("#btn-restore")).to_be_disabled()
+    await page.locator("#btn-browse").click()
+    await expect(page.get_by_role("button", name="📁 app_data", exact=True)).to_be_visible()
+    assert not api.posts
 
 
 async def test_live_receiver_details_and_incomplete_incoming_after_outgoing_success(browser_ui):

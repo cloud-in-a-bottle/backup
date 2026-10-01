@@ -132,7 +132,7 @@ class Peer:
     def __init__(self, *args): pass
     async def request(self, method, path, **kwargs):
         if path.endswith("capabilities"):
-            return {"ok": True, "version": 5, "chunk_limit": m.CHUNK_LIMIT, "backup_app_name": "backup"}
+            return {"ok": True, "version": 5, "chunk_limit": m.CHUNK_LIMIT, "backup_app_name": "backup", "capture_complete": True}
         return {"ok": True, "version": 5, "session_id": "d" * 64, "accepted_apps": ["alpha"]}
 m.capture_configuration, m.RecoverySession, m._Peer = capture, Source, Peer
 asyncio.run(m.run_direct_push(target_url="https://destination.test", target_token="owner", selected_apps=["alpha"],

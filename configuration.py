@@ -392,9 +392,6 @@ def subset_configuration(bundle: dict, names: set[str]) -> dict:
             for entry in app[field]
         }
         services.update(p["service_url"] for p in runtime["providers"] if p["app_name"] in names)
-        # Private Git clones are router OAuth consumers, not app grant holders.
-        if any(app["source"]["kind"] == "remote" for app in result["definitions"]["apps"]):
-            services.add("github.com/imbue-openhost/openhost/services/oauth")
         runtime["providers"] = [p for p in runtime["providers"] if p["service_url"] in services]
     return result
 

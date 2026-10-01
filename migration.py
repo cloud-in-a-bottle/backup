@@ -221,6 +221,10 @@ class MigrationReceiver:
                     self._record["session_id"] = sid
                 if "snapshot" in saved:
                     self._record["snapshot"] = _session_id(saved["snapshot"])
+                if "started_at" in saved:
+                    if type(saved["started_at"]) is not int or saved["started_at"] < 0:
+                        raise ValueError
+                    self._record["started_at"] = saved["started_at"]
                 if phase == "complete" and saved.get("ok") is True and not attention:
                     self._record.update(ok=True, phase="complete", result={"ok": True})
                 if saved["version"] == 4:
@@ -252,7 +256,8 @@ class MigrationReceiver:
 
     async def capabilities(self, *, owner_token):
         await _authenticate_owner(self.router_url, owner_token)
-        return {"ok": True, "version": 5, "chunk_limit": CHUNK_LIMIT, "backup_app_name": self.backup_app_name}
+        return {"ok": True, "version": 5, "chunk_limit": CHUNK_LIMIT, "backup_app_name": self.backup_app_name,
+                "capture_complete": True}
 
     def _lookup(self, sid):
         _session_id(sid)
@@ -260,7 +265,9 @@ class MigrationReceiver:
             raise MigrationError("session")
 
     async def start(self, body, *, owner_token):
-        _body(body, {"bundle", "password"})
+        _body(body, {"bundle", "password", "capture_complete"})
+        if body["capture_complete"] is not True:
+            raise MigrationError("protocol")
         try:
             bundle = parse_configuration(serialize_configuration(body["bundle"]))
         except (ValueError, TypeError):
@@ -295,7 +302,8 @@ class MigrationReceiver:
                 self._bundle, self._password = bundle, password
                 self._recovery = session
                 self._record = {"ok": True, "version": 5, "session_id": sid, "phase": "receiving",
-                                "accepted_apps": list(session.restore_app_names), "result": None, "needs_attention": False}
+                                "accepted_apps": list(session.restore_app_names), "result": None, "needs_attention": False,
+                                "started_at": time.time_ns()}
                 self._save()
                 self._activity = time.monotonic()
                 self._monitor = asyncio.create_task(self._watch())
@@ -623,6 +631,7 @@ async def _capture_and_transfer(peer, sid, temporary, password, root, bundle):
         output = await _restic(temporary, password, *args, str(root), str(configuration_file))
     summary = json.loads(output.splitlines()[-1])
     snapshot_id = _session_id(summary["snapshot_id"])
+    snapshot_id = await snapshots.complete_capture(snapshot_id, _restic_env(temporary, password))
     objects = [("config", "config", temporary / "config")]
     for kind in sorted(_OBJECT_KINDS):
         objects.extend((kind, p.name, p) for p in (temporary / kind).rglob("*") if p.is_file())
@@ -657,7 +666,7 @@ async def run_direct_push(*, target_url, target_token, selected_apps, lock, all_
     outcome = intent = False
     heartbeat = asyncio.create_task(_heartbeat(lock))
     log.clear()
-    status = {"phase": "preflighting", "ok": False}
+    status = {"phase": "preflighting", "ok": False, "started_at": time.time_ns()}
     try:
         work = private_work_dir(all_app_data, work_dir, backup_app_name)
         record = initialize_source_recovery(lock=lock, all_app_data=all_app_data, work_dir=work_dir,
@@ -670,7 +679,7 @@ async def run_direct_push(*, target_url, target_token, selected_apps, lock, all_
         _positive(poll_interval)
         async with asyncio.timeout(_positive(deadline)):
             capability = await peer.request("GET", "/api/migration/receive/capabilities")
-            if capability.get("ok") is not True or capability.get("chunk_limit") != CHUNK_LIMIT:
+            if capability.get("ok") is not True or capability.get("chunk_limit") != CHUNK_LIMIT or capability.get("capture_complete") is not True:
                 raise MigrationError("protocol")
             executor = app_name(capability.get("backup_app_name"))
             captured = await capture_configuration(router_url, app_token, owner_token, backup_app_name)
@@ -690,7 +699,8 @@ async def run_direct_push(*, target_url, target_token, selected_apps, lock, all_
             if {a["name"]: a["status"] for a in before} != {n: a["status"] for n, a in captured["runtime"]["apps"].items()}:
                 raise MigrationError("sequence")
             password = secrets.token_hex(32)
-            accepted = await peer.request("POST", "/api/migration/receive/start", body={"version": 5, "bundle": bundle, "password": password})
+            accepted = await peer.request("POST", "/api/migration/receive/start", body={"version": 5, "bundle": bundle, "password": password,
+                                                                                     "capture_complete": True})
             sid = _session_id(accepted.get("session_id"))
             if accepted.get("ok") is not True or accepted.get("accepted_apps") != sorted(selected):
                 raise MigrationError("sequence")
@@ -745,8 +755,10 @@ async def run_direct_push(*, target_url, target_token, selected_apps, lock, all_
             if source is not None:
                 try:
                     result = await source.restart_unaffected()
+                    confirmed = await source.confirm_source_cutover()
+                    result = source.progress
                     status["source_recovery"] = result
-                    if any(not a["selected"] and a["previous_status"] == "running" and a["restart"] != "confirmed" for a in result["paused_apps"]):
+                    if not confirmed or any(not a["selected"] and a["previous_status"] == "running" and a["restart"] != "confirmed" for a in result["paused_apps"]):
                         outcome = False
                 except BaseException:
                     logger.exception("Could not resume unaffected source apps")

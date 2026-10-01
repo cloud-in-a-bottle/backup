@@ -46,6 +46,17 @@ def kill_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+def abort_failed_reader(proc: asyncio.subprocess.Process, stream: asyncio.StreamReader) -> None:
+    """Reapability after a reader failure requires closing even a paused pipe.
+
+    asyncio's Process exposes its reader but no public pipe-close method. Keep
+    the transport access here with subprocess ownership, never start a competing
+    reader, and close only after the original reader has failed.
+    """
+    kill_group(proc)
+    stream._transport.close()
+
+
 async def finish_communication(task: asyncio.Task) -> None:
     async def finish() -> None:
         try:

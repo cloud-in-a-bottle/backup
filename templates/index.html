@@ -1088,7 +1088,7 @@
 
             slice.forEach(s => {
                 const rec = snapshotsNameMap[s.id] || snapshotsNameMap[s.short_id] || null;
-                const name = (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
+                const name = s.name || (s.tags || []).filter(t => t.startsWith("name:")).map(t => t.slice(5))[0] || (rec && rec.name) || "";
                 const source = (s.tags || []).filter(t => t.startsWith("zone:")).map(t => t.slice(5))[0] || s.hostname || "Unknown";
                 const sizeBytes = rec && rec.total_size_bytes != null ? rec.total_size_bytes : null;
                 const sizeText = sizeBytes != null ? formatBytes(sizeBytes) : "-";
@@ -1289,6 +1289,10 @@
         }
 
         function snapshotScope(snapshot) {
+            if (snapshot?.has_configuration === true && snapshot.capture_complete === false) return {
+                label: 'Capture incomplete or unconfirmed',
+                description: 'Whole-app recovery is unavailable because successful capture was not confirmed. Captured files remain available for file-only recovery.'
+            };
             if (!snapshot || snapshot.has_configuration !== true) return {
                 label: 'Files only',
                 description: 'App definitions, API keys and app states are not included.'
@@ -1394,7 +1398,9 @@
 
         function updateRestoreButtons() {
             const btn = document.getElementById('btn-restore');
-            btn.disabled = restoreBusy || restoreSubmitting || acknowledgeBusy || lockWasBusy || !selectedSnapshotId;
+            const snapshot = snapshotsAll.find(s => s.id === selectedSnapshotId);
+            const unconfirmed = snapshot?.has_configuration === true && snapshot.capture_complete === false;
+            btn.disabled = restoreBusy || restoreSubmitting || acknowledgeBusy || lockWasBusy || !selectedSnapshotId || unconfirmed;
             btn.textContent = restoreBusy || restoreSubmitting ? 'Restoring...' : 'Restore';
             document.getElementById('btn-acknowledge').disabled = acknowledgeBusy || restoreBusy || restoreSubmitting || lockWasBusy;
         }
@@ -1404,6 +1410,7 @@
         async function triggerRestore() {
             if (!selectedSnapshotId || restoreBusy || restoreSubmitting || acknowledgeBusy || lockWasBusy) return;
             const snapshot = snapshotsAll.find(s => s.id === selectedSnapshotId);
+            if (snapshot?.has_configuration === true && snapshot.capture_complete === false) return;
             const scope = snapshotScope(snapshot);
             const effects = snapshot?.has_configuration === true ?
                 'This replaces selected app data across captured roots, removing stale files. Recovery pauses non-backup apps and waits for readiness. Existing and new selected apps run before saved stopped states are applied.' :
@@ -1470,6 +1477,7 @@
                     'Could not read private configuration from this snapshot.',
                     'Could not read the selected snapshot.',
                     'This snapshot contains unsupported data roots.',
+                    'This snapshot has no confirmed complete capture. Use file-only recovery or select a completed backup.',
                     'Invalid private configuration bundle.',
                     'Expected a valid schema-v2 Private app definition document.',
                     'The router could not be reached or the request timed out.',
@@ -1626,7 +1634,10 @@
             const progressEl = document.getElementById("mig-progress");
             progressEl.style.display = phase || res.running ? 'block' : 'none';
             const incoming = res.receive;
-            const incomingIncomplete = incoming && (incoming.phase !== 'complete' || incoming.result?.ok !== true || incoming.needs_attention === true);
+            // Historical aborted/acknowledged receives do not invalidate a later
+            // outgoing cutover. An explicit attention flag still takes priority.
+            const incomingIncomplete = incoming && (incoming.needs_attention === true ||
+                (incoming.needs_attention !== false && (incoming.phase !== 'complete' || incoming.result?.ok !== true)));
             const needsAttention = incomingIncomplete || res.source_recovery?.needs_attention === true;
             const complete = !res.running && phase === 'done' && !needsAttention;
             const badge = document.getElementById('mig-phase');
