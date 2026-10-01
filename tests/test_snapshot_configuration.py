@@ -87,6 +87,9 @@ async def newest_snapshot():
 
 async def test_real_restic_snapshot_contains_private_configuration_and_data(environment):
     data, temporary, archive, conf, capture = environment
+    unusual = data / "demo" / "drafts [v1] & 'review' 📝"
+    unusual.mkdir()
+    (unusual / "notes.json").write_text("{}")
     assert await backup_app.run_backup(name="configuration recovery")
     capture.assert_awaited_once_with(backup_app.ROUTER_URL, "synthetic-app-token", OWNER_CREDENTIAL, "backup")
     saved = await newest_snapshot()
@@ -99,6 +102,11 @@ async def test_real_restic_snapshot_contains_private_configuration_and_data(envi
     encoded = json.dumps(parsed)
     assert RAW_KEY not in encoded and OWNER_CREDENTIAL not in encoded
     assert "synthetic-restic-password" not in encoded
+    files, error = await backup_app.list_snapshot_files(saved["id"], str(snapshots.CONFIGURATION_FILE.parent).lstrip("/"))
+    assert error is None
+    assert any(entry["path"] == "configuration.json" and not entry["is_dir"] and entry["size"] > 0 for entry in files)
+    files, error = await backup_app.list_snapshot_files(saved["id"], str(unusual).lstrip("/"))
+    assert error is None and [entry["path"] for entry in files] == ["notes.json"]
     rc, content, _ = await backup_app._run_restic(["dump", saved["id"], str(data / "demo" / "secret.txt"), "--no-lock"], conf)
     assert rc == 0 and content.decode() == APP_SECRET
     for excluded in (backup_app.CONFIG_FILE, temporary / "backup" / "private-scratch", archive / "archive.txt"):

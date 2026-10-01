@@ -1106,46 +1106,22 @@ class TestZoneTagging:
 
 
 class TestSnapshotBrowsing:
-    """Top-level roots come from snapshot metadata (no recursive ls probe),
-    and directory listings stream instead of buffering the whole subtree."""
+    """Browse the actual snapshot tree, including paths outside named data roots."""
 
-    async def test_roots_come_from_metadata_without_ls(self, client):
-        root_paths = {name: str(p) for name, p in backup_app._ROOT_NAMES.items()}
-        snap_json = json.dumps(
-            [{"id": "s" * 64, "paths": [root_paths["app_data"], root_paths["vm_data"]]}]
-        ).encode()
-        calls = []
-
-        async def fake_run_restic(args, conf, timeout=None):
-            calls.append(args)
-            return 0, snap_json, b""
-
-        with patch.object(backup_app, "_run_restic", fake_run_restic):
-            roots = await backup_app._list_roots_in_snapshot(
-                "s" * 64, {"repo": "r", "repo_password": "p"}
-            )
-        assert {r["path"] for r in roots} == {"app_data", "vm_data"}
-        # Exactly one restic call — the metadata lookup — and never an ls probe.
-        assert len(calls) == 1
-        assert calls[0][0] == "snapshots"
-        assert all(a[0] != "ls" for a in calls)
-
-    async def test_metadata_failure_falls_back_to_ls(self, client):
-        # When the metadata read fails, we fall back to per-root ls probing.
-        calls = []
-
-        async def fake_run_restic(args, conf, timeout=None):
-            calls.append(args)
-            if args[0] == "snapshots":
-                return 1, b"", b"boom"  # metadata read fails
-            return 0, b"", b""  # ls probe: root present
-
-        with patch.object(backup_app, "_run_restic", fake_run_restic):
-            roots = await backup_app._list_roots_in_snapshot(
-                "s" * 64, {"repo": "r", "repo_password": "p"}
-            )
-        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
-        assert any(a[0] == "ls" for a in calls)  # fallback ran
+    async def test_top_level_shows_every_snapshot_entry(self, client):
+        async def listing(args, conf, timeout, on_line):
+            assert args == ["ls", "--json", "a" * 64, "/", "--no-lock"]
+            for path, kind in [("/", "dir"), ("/data", "dir"), ("/tmp", "dir"),
+                               ("/other", "dir"), ("/readme.txt", "file"), ("/tmp/configuration.json", "file")]:
+                on_line(json.dumps({"struct_type": "node", "path": path, "type": kind}))
+            return 0, b""
+        with patch.object(backup_app, "load_config", return_value={"repo": "r", "repo_password": "p"}), \
+             patch.object(backup_app, "_run_restic_streaming", listing):
+            response = await client.get("/api/snapshot/files", query_string={"snapshot": "a" * 64})
+        assert response.status_code == 200
+        body = await response.get_json()
+        assert body["ok"] is True
+        assert {entry["path"] for entry in body["files"]} == {"data", "tmp", "other", "readme.txt"}
 
     async def test_listing_streams_only_immediate_children(self, client):
         conf = backup_app.load_config()
@@ -1191,23 +1167,25 @@ class TestSnapshotBrowsing:
         d1 = next(f for f in files if f["path"] == "dir1")
         assert d1["is_dir"] is True
 
-    async def test_metadata_with_no_matching_roots_falls_back_to_ls(self, client):
-        # Metadata is readable but its paths don't match any known root — must
-        # defer to the authoritative ls probe, not report "no roots".
-        calls = []
+    @pytest.mark.parametrize("path", ["tmp/bottle-backup-configuration", "other/drafts [v1] & 'review' 📝", "data/percent%#?"])
+    async def test_browse_arbitrary_snapshot_directories(self, client, path):
+        async def listing(args, conf, timeout, on_line):
+            assert args == ["ls", "--json", "a" * 64, "/" + path, "--no-lock"]
+            on_line(json.dumps({"struct_type": "node", "path": "/" + path + "/configuration.json", "type": "file", "size": 123}))
+            return 0, b""
+        with patch.object(backup_app, "load_config", return_value={"repo": "r", "repo_password": "p"}), \
+             patch.object(backup_app, "_run_restic_streaming", listing):
+            response = await client.get("/api/snapshot/files", query_string={"snapshot": "a" * 64, "path": path})
+        body = await response.get_json()
+        assert response.status_code == 200 and body["ok"] is True
+        assert body["files"] == [{"path": "configuration.json", "is_dir": False, "size": 123, "mod_time": ""}]
 
-        async def fake_run_restic(args, conf, timeout=None):
-            calls.append(args)
-            if args[0] == "snapshots":
-                return 0, json.dumps([{"id": "s" * 64, "paths": ["/other"]}]).encode(), b""
-            return 0, b"", b""  # ls probe: root present
-
-        with patch.object(backup_app, "_run_restic", fake_run_restic):
-            roots = await backup_app._list_roots_in_snapshot(
-                "s" * 64, {"repo": "r", "repo_password": "p"}
-            )
-        assert {r["path"] for r in roots} == set(backup_app._ROOT_NAMES)
-        assert any(a[0] == "ls" for a in calls)  # fell back to probing
+    @pytest.mark.parametrize("path", ["/etc", "..", "data/../tmp", "data/./app_data", "data//app_data", "data/\x00"])
+    async def test_invalid_paths_never_reach_restic(self, client, path):
+        with patch.object(backup_app, "_run_restic_streaming", AsyncMock()) as listing:
+            response = await client.get("/api/snapshot/files", query_string={"snapshot": "a" * 64, "path": path})
+        assert response.status_code == 400
+        listing.assert_not_awaited()
 
 
 class TestRetention:

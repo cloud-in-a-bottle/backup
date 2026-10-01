@@ -18,8 +18,8 @@ import restic_process
 CONFIGURATION_TAG = "bottle-configuration-v1"
 RUNTIME_TAG = "bottle-runtime-v1"
 # An explicit restic input outside app data, including the excluded backup repo.
-# This container-local path is stable across instances and never browsable through
-# the app-data file browser. It is removed as soon as the backup process settles.
+# This container-local path is stable across instances. The snapshot browser can
+# list it; the local staging file is removed as soon as the backup process settles.
 CONFIGURATION_FILE = Path("/tmp/bottle-backup-configuration/configuration.json")
 _SNAPSHOT_ID = re.compile(r"[a-f0-9]{8,64}")
 _FULL_SNAPSHOT_ID = re.compile(r"[a-f0-9]{64}")

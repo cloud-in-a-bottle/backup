@@ -253,7 +253,7 @@
                     <p class="info" id="selected-snapshot-scope" style="margin-top:8px;"></p>
                 </details>
                 <div class="btn-row">
-                    <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot(null, '')">Browse</button>
+                    <button class="btn-secondary" id="btn-browse" onclick="browseSnapshot('')">Browse</button>
                     <button class="btn-danger" id="btn-restore" onclick="triggerRestore()">Restore</button>
                     <button class="btn-danger" id="btn-delete" onclick="deleteSnapshot()">Delete</button>
                 </div>
@@ -468,14 +468,6 @@
         // target or a stop candidate for itself.
         const APP_NAME = {{ app_name | tojson }};
         const BASE = "{{ base_path }}";
-        // Excluded entries are sourced from the same _backup_scope_summary
-        // helper that renders the Status panel, so the in-browser note
-        // and the Status panel can never disagree about which paths
-        // are excluded.  Each entry carries ``user_facing`` so the
-        // snapshots-browser note can skip implementation-detail
-        // exclusions (e.g. the backup app's own data dir)
-        // without the JS having to know which path that is.
-        const EXCLUDED_ENTRIES = {{ scope.excluded | tojson }};
         let selectedSnapshotId = null;
         // Client-side pagination for the snapshots table. The /api/snapshots
         // endpoint returns the full list in one shot (restic has no native
@@ -1194,50 +1186,16 @@
         // are unsafe with user-controllable content (adversarial filenames in
         // snapshots). Using textContent + data-* + delegated listeners is
         // safe because the DOM never interprets the value as code.
-        function makeBrowseLink(label, root, path) {
+        function makeBrowseLink(label, path) {
             const span = document.createElement("button");
             span.className = "browse-link";
             span.textContent = label;
-            span.dataset.root = root || "";
             span.dataset.path = path || "";
-            span.addEventListener("click", () => browseSnapshot(root, path));
+            span.addEventListener("click", () => browseSnapshot(path));
             return span;
         }
 
-        // Surface the same exclusion list that's in the Status panel
-        // here too — at the synthetic top of the file browser users
-        // see "where's app_archive?" most often, since access_all_app_data
-        // does mount /data/app_archive into the backup app and a
-        // separate UI (the file browser of an access_all_app_data app) does
-        // show those bytes.  Paths come from EXCLUDED_ENTRIES, populated
-        // from the server-side _backup_scope_summary helper, so the
-        // two UI surfaces can never disagree about what's excluded.
-        // Wording stays brief here; the full per-path rationale lives
-        // in the Status panel and we link there.
-        function _appendArchiveExclusionNote(tbody) {
-            // Show only the operator-relevant exclusions; the helper
-            // marks implementation-detail ones (like the backup app's
-            // own restic repo dir) as ``user_facing=false``.
-            const userExcludes = EXCLUDED_ENTRIES.filter(e => e.user_facing).map(e => e.path);
-            if (userExcludes.length === 0) return;
-            const tr = document.createElement("tr");
-            const td = document.createElement("td");
-            td.colSpan = 3;
-            td.style.cssText = "padding:8px;color:#666;font-size:0.8rem;border-top:1px dashed #e5e7eb;";
-            const codeBits = userExcludes.map(p => {
-                const code = document.createElement("code");
-                code.style.cssText = "background:#f3f4f6;padding:1px 4px;border-radius:3px;";
-                code.textContent = p;
-                return code.outerHTML;
-            });
-            td.innerHTML = "Note: " + codeBits.join(", ") +
-                " " + (userExcludes.length === 1 ? "is" : "are") +
-                " intentionally not captured. See <em>What is and isn't backed up</em> in the Status section for details.";
-            tr.appendChild(td);
-            tbody.appendChild(tr);
-        }
-
-        function renderFileBrowser(res, root, subpath) {
+        function renderFileBrowser(res, subpath) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
@@ -1254,19 +1212,15 @@
                 return;
             }
 
-            // Breadcrumb: snapshot root -> [root name] -> subpath parts
+            // Breadcrumb follows the actual paths stored in the snapshot.
             breadcrumb.textContent = "";
-            breadcrumb.appendChild(makeBrowseLink("snapshot", null, ""));
-            if (root) {
-                breadcrumb.appendChild(document.createTextNode(" / "));
-                breadcrumb.appendChild(makeBrowseLink(root, root, ""));
-            }
+            breadcrumb.appendChild(makeBrowseLink("snapshot", ""));
             const parts = subpath ? subpath.split("/") : [];
             let accumulated = "";
             parts.forEach((p, i) => {
                 accumulated += (i > 0 ? "/" : "") + p;
                 breadcrumb.appendChild(document.createTextNode(" / "));
-                breadcrumb.appendChild(makeBrowseLink(p, root, accumulated));
+                breadcrumb.appendChild(makeBrowseLink(p, accumulated));
             });
 
             body.textContent = "";
@@ -1275,13 +1229,11 @@
                 const td = document.createElement("td");
                 td.colSpan = 3;
                 td.style.cssText = "padding:6px 8px;color:#666;";
-                td.textContent = root ? "Empty directory" : "Snapshot has no captured roots";
+                td.textContent = "Empty directory";
                 tr.appendChild(td);
                 body.appendChild(tr);
-                if (!root) _appendArchiveExclusionNote(body);
                 return;
             }
-            if (!root) _appendArchiveExclusionNote(body);
 
             const sorted = res.files.slice().sort((a, b) => {
                 if (a.is_dir !== b.is_dir) return a.is_dir ? -1 : 1;
@@ -1295,17 +1247,8 @@
                 const nameTd = document.createElement("td");
                 nameTd.style.cssText = "padding:6px 8px;";
                 if (f.is_dir) {
-                    // At the synthetic root (no root selected yet), each row IS
-                    // a root; clicking it enters that root at empty subpath.
-                    // Otherwise, it's a dir within a root; clicking appends.
-                    if (!root) {
-                        const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, f.path, "");
-                        nameTd.appendChild(link);
-                    } else {
-                        const fullPath = subpath ? subpath + "/" + f.path : f.path;
-                        const link = makeBrowseLink("\uD83D\uDCC1 " + f.path, root, fullPath);
-                        nameTd.appendChild(link);
-                    }
+                    const fullPath = subpath ? subpath + "/" + f.path : f.path;
+                    nameTd.appendChild(makeBrowseLink("\uD83D\uDCC1 " + f.path, fullPath));
                 } else {
                     nameTd.textContent = "\uD83D\uDCC4 " + f.path;
                 }
@@ -1325,7 +1268,7 @@
             });
         }
 
-        async function browseSnapshot(root, subpath) {
+        async function browseSnapshot(subpath) {
             if (!selectedSnapshotId) return;
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
@@ -1333,10 +1276,9 @@
             container.style.display = "block";
 
             let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(selectedSnapshotId);
-            if (root) url += "&root=" + encodeURIComponent(root);
             if (subpath) url += "&path=" + encodeURIComponent(subpath);
             const res = await api(url);
-            renderFileBrowser(res, root || null, subpath || "");
+            renderFileBrowser(res, subpath || "");
         }
 
         function snapshotScope(snapshot) {

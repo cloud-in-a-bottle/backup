@@ -41,9 +41,7 @@ def test_app_archive_not_in_backup_roots() -> None:
 
 
 def test_app_archive_not_in_root_names() -> None:
-    """The restore UI surfaces ``_ROOT_NAMES`` to operators — the
-    archive tier shouldn't be selectable as a restore target.
-    """
+    """The archive tier is not a root-specific restore shortcut."""
     assert "app_archive" not in backup_app._ROOT_NAMES
     assert Path("/data/app_archive") not in backup_app._ROOT_NAMES.values()
 

@@ -1217,16 +1217,17 @@ async def repo_stats() -> tuple[dict | None, str | None]:
 
 
 def validate_subpath(path: str) -> bool:
+    if not isinstance(path, str) or "\x00" in path:
+        return False
     if not path:
         return True
     for seg in path.split("/"):
         if seg in ("..", ".") or not seg:
             return False
-        if not re.match(r"^[\w\-:. ]+$", seg):
-            return False
     return True
 
 
+# Named shortcuts for root-specific restores and API browsing.
 _ROOT_NAMES = {
     "app_data": ALL_APP_DATA,
     "app_temp_data": APP_TEMP_DATA,
@@ -1245,7 +1246,7 @@ async def _run_restic_streaming(
 
     Unlike ``_run_restic`` (which buffers all of stdout via ``communicate``),
     this reads stdout incrementally so a large ``restic ls`` doesn't
-    materialise the whole recursive listing in memory — the caller keeps only
+    materialise the whole listing in memory — the caller keeps only
     what it needs. stderr is drained concurrently to avoid a pipe-buffer
     deadlock, and the subprocess is killed on timeout/cancellation so we don't
     leak a restic process holding the repo lock.
@@ -1299,104 +1300,24 @@ async def _run_restic_streaming(
     return proc.returncode, bytes(stderr_buf)
 
 
-async def _roots_from_snapshot_metadata(
-    snapshot_id: str, conf: dict
-) -> list[dict] | None:
-    """Which BACKUP_ROOTS a snapshot captured, read from its metadata.
-
-    A snapshot records the absolute paths it backed up, so a single
-    ``restic snapshots`` call tells us which roots are present — no recursive
-    ``ls`` walk needed. Returns the present-root entries, or ``None`` if the
-    metadata can't be read (the caller then falls back to probing).
-    """
-    try:
-        rc, stdout, _stderr = await _run_restic(
-            ["snapshots", "--json", snapshot_id, "--no-lock"], conf, timeout=60
-        )
-    except Exception:
-        return None
-    if rc != 0:
-        return None
-    try:
-        entries = json.loads(stdout.decode(errors="replace") or "[]")
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(entries, list) or not entries:
-        return None
-    captured: set[str] = set()
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        for p in e.get("paths", []) or []:
-            captured.add(str(p).rstrip("/"))
-    matched = [
-        {"path": name, "size": 0, "is_dir": True, "mod_time": ""}
-        for name, path in _ROOT_NAMES.items()
-        if str(path).rstrip("/") in captured
-    ]
-    # A real snapshot always captures at least one root, so an empty match
-    # means the metadata paths didn't line up as expected (e.g. a
-    # normalization difference). Defer to the authoritative ls probe rather
-    # than wrongly reporting "no roots".
-    return matched or None
-
-
-async def _list_roots_in_snapshot(snapshot_id: str, conf: dict):
-    """Return the list of BACKUP_ROOTS actually present in this snapshot.
-
-    A snapshot only contains roots that existed on disk at backup time. We
-    read which ones from the snapshot's own metadata (cheap); only if that
-    can't be read do we fall back to probing each root with ``restic ls``.
-    """
-    roots = await _roots_from_snapshot_metadata(snapshot_id, conf)
-    if roots is not None:
-        return roots
-    present: list[dict] = []
-    for name, path in _ROOT_NAMES.items():
-        args = ["ls", "--json", snapshot_id, str(path), "--no-lock"]
-        try:
-            rc, _stdout, _stderr = await _run_restic(args, conf, timeout=60)
-        except Exception:
-            continue
-        if rc == 0:
-            present.append(
-                {
-                    "path": name,
-                    "size": 0,
-                    "is_dir": True,
-                    "mod_time": "",
-                }
-            )
-    return present
-
-
 async def list_snapshot_files(
     snapshot_id: str, subpath: str = "", root: str | None = None
 ):
-    """List files in a snapshot.
+    """List direct children anywhere in the snapshot's actual filesystem tree.
 
-    Browsing model:
-      * ``root`` unset → return the synthetic top level (one entry per
-        captured root: app_data / app_temp_data / vm_data).
-      * ``root`` set → resolve to the matching absolute path, optionally
-        appended with ``subpath``, and return direct children of that dir
-        from the snapshot.
-
-    Returns ``(files, error)``.
+    Paths are relative to the snapshot's /, or to an optional named data root.
+    Reads only the restic repository, never the live filesystem.
     """
     conf = load_config()
     if not conf.get("repo") or not conf.get("repo_password"):
         return [], "Restic repo not configured"
 
-    if not root:
-        # Top level: surface which roots the snapshot actually contains.
-        return await _list_roots_in_snapshot(snapshot_id, conf), None
-
-    if root not in _ROOT_NAMES:
+    if not validate_subpath(subpath):
+        return [], "Invalid path"
+    if root is not None and root not in _ROOT_NAMES:
         return [], f"Unknown root: {root}"
 
-    # Resolve the absolute path restic is being asked about.
-    target_path = str(_ROOT_NAMES[root])
+    target_path = str(_ROOT_NAMES[root]) if root else "/"
     if subpath:
         target_path = target_path.rstrip("/") + "/" + subpath
 
@@ -1421,7 +1342,7 @@ async def list_snapshot_files(
             # Could also be an exact match of the target (the dir itself) — skip.
             return
         rest = path[len(target_norm) + 1 :]
-        if "/" in rest:
+        if not rest or "/" in rest:
             return  # nested deeper, not a direct child
         files.append(
             {
@@ -1432,9 +1353,8 @@ async def list_snapshot_files(
             }
         )
 
-    # `restic ls` lists the whole subtree recursively; stream it line-by-line
-    # and keep only the direct children rather than buffering the entire
-    # listing (which can be huge/deep) in memory.
+    # An explicit directory filter without --recursive bounds traversal to this
+    # level. Stream the output so large directories don't duplicate the listing.
     try:
         rc, stderr = await _run_restic_streaming(args, conf, 120, _collect)
     except Exception as e:
@@ -2844,8 +2764,7 @@ async def snapshot_files():
     snapshot_id = request.args.get("snapshot", "")
     if not snapshot_id or not SNAPSHOT_ID_RE.match(snapshot_id):
         return jsonify(ok=False, error="Invalid snapshot id"), 400
-    # ``root`` picks one of the three captured top-level trees. Omitted =
-    # return the synthetic root that lists all captured trees.
+    # Optional named-root shortcuts; otherwise browse from the snapshot's /.
     root = request.args.get("root") or None
     if root is not None and root not in _ROOT_NAMES:
         return jsonify(ok=False, error=f"Unknown root: {root}"), 400

@@ -97,7 +97,7 @@ Retention runs `forget` inline after the backup and reconciles the backup histor
 
 Each successful backup creates a restic snapshot tagged with `bottle`. Older snapshots tagged `openhost` are still listed, restored, and expired. The UI lists snapshots newest-first and lets you:
 
-- Browse captured files by data root (`app_data`, `app_temp_data`, and legacy `vm_data`)
+- Browse the complete snapshot tree, including app data and `/tmp/bottle-backup-configuration/configuration.json`
 - Restore a full snapshot (all captured data roots, with the exclusions described below; single-root restore is API-only)
 - Delete a snapshot (runs `restic forget --prune` to reclaim space)
 - Name or rename a snapshot for easier identification
@@ -180,7 +180,7 @@ All routes are registered at both `/path` and `/backup/path` to handle the Cloud
 | POST | `/api/restore` | Restore a snapshot (JSON: `snapshot`, optional `root`); configuration snapshots require a caller confirmed as owner |
 | GET | `/api/restore/status` | `running`, `last_restore`, `last_status`, `needs_attention` and safe `progress` with recovery outcomes |
 | POST | `/api/restore/acknowledge` | Clear an incomplete recovery notice after inspection (owner authority required); does not restart apps or remove retained originals |
-| GET | `/api/snapshot/files` | Browse files in a snapshot (query: `snapshot`, `root`, `path`) |
+| GET | `/api/snapshot/files` | Browse the snapshot tree (`snapshot`, `path` relative to its root; optional named `root` shortcut) |
 | POST | `/api/snapshot/delete` | Delete a snapshot |
 | POST | `/api/check` | Run `restic check` |
 | GET | `/api/check/status` | Last check result |

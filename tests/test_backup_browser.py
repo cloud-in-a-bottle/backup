@@ -11,6 +11,7 @@ import copy
 import os
 import socket
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ LIMITED = "b" * 64
 LEGACY = "c" * 64
 PRIVATE = "PRIVATE-CANARY-must-not-render"
 OWNER = "owner-token-private-sentinel"
+UNUSUAL_DIR = "drafts [v1] & 'review' 📝"
 
 @pytest.fixture
 async def ui_server(tmp_path, monkeypatch):
@@ -162,6 +164,17 @@ class MockAPI:
         if path == "status" and self.status_offline:
             await route.abort()
             return
+        query = parse_qs(urlsplit(request.url).query)
+        snapshot_path = query.get("path", [""])[0]
+        tree = {
+            "": [{"path": "data", "is_dir": True}] + (
+                [{"path": "tmp", "is_dir": True}] if query.get("snapshot") != [LEGACY] else []),
+            "data": [{"path": "app_data", "is_dir": True}, {"path": "app_temp_data", "is_dir": True}],
+            "data/app_data": [{"path": UNUSUAL_DIR, "is_dir": True}],
+            "data/app_data/" + UNUSUAL_DIR: [{"path": "notes.json", "is_dir": False, "size": 2}],
+            "tmp": [{"path": "bottle-backup-configuration", "is_dir": True}],
+            "tmp/bottle-backup-configuration": [{"path": "configuration.json", "is_dir": False, "size": 123}],
+        }
         responses = {
             "status": {"busy": self.busy, "running": False},
             "restore/status": self.restore,
@@ -174,7 +187,7 @@ class MockAPI:
             "history": {"ok": True, "history": []},
             "repo/stats": {"ok": True, "stats": {}},
             "apps-status": {"ok": True, "apps": {"notes": {"status": "running"}, "secrets": {"status": "stopped"}}},
-            "snapshot/files": {"ok": True, "files": [{"path": "app_data", "is_dir": True}]},
+            "snapshot/files": {"ok": True, "files": tree.get(snapshot_path, [])},
         }
         if path not in responses:
             await route.fulfill(status=404, json={"ok": False})
@@ -231,12 +244,26 @@ async def test_snapshot_contents_keyboard_selection_and_file_browser(browser_ui)
     await expect(page.locator("#selected-snapshot-scope")).to_be_visible()
     await expect(page.locator("#selected-snapshot-scope")).to_contain_text("App definitions, API keys and app states are not included")
     await page.get_by_role("button", name="Browse", exact=True).click()
+    await page.get_by_role("button", name="📁 data", exact=True).click()
     await expect(page.get_by_role("button", name="📁 app_data")).to_be_visible()
     await select_snapshot(page, "bbbbbbbb")
     await expect(contents).to_have_text("Files and app definitions")
     await expect(page.locator("#selected-snapshot-scope")).to_contain_text("were not captured")
     await select_snapshot(page)
     await expect(contents).to_have_text("Files and settings")
+    await page.get_by_role("button", name="Browse", exact=True).click()
+    await page.get_by_role("button", name="📁 tmp", exact=True).click()
+    await page.get_by_role("button", name="📁 bottle-backup-configuration", exact=True).click()
+    await expect(page.locator("#browse-body")).to_contain_text("configuration.json")
+    await expect(page.locator("#browse-breadcrumb")).to_have_text("snapshot / tmp / bottle-backup-configuration")
+    await page.locator("#browse-breadcrumb").get_by_role("button", name="tmp", exact=True).click()
+    await expect(page.get_by_role("button", name="📁 bottle-backup-configuration", exact=True)).to_be_visible()
+    await page.locator("#browse-breadcrumb").get_by_role("button", name="snapshot", exact=True).click()
+    await expect(page.get_by_role("button", name="📁 data", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="📁 data", exact=True).click()
+    await page.get_by_role("button", name="📁 app_data", exact=True).click()
+    await page.get_by_role("button", name="📁 " + UNUSUAL_DIR, exact=True).click()
+    await expect(page.locator("#browse-body")).to_contain_text("notes.json")
 
 
 async def test_restore_acceptance_busy_and_eventual_verified_success(browser_ui):
