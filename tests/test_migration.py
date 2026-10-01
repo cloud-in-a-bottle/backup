@@ -96,9 +96,11 @@ async def finish(env, sid, snapshot):
     return env.receiver.journal_status
 
 
-@pytest.mark.parametrize("variant", ["normal", "lost-upload", "stopped", "empty", "large"])
-async def test_real_snapshot_transfer_and_shared_restore(receiver, tmp_path, variant):
+@pytest.mark.parametrize("variant", ["normal", "lost-upload", "stopped", "empty", "large", "inherited-env"])
+async def test_real_snapshot_transfer_and_shared_restore(receiver, tmp_path, monkeypatch, variant):
     env = receiver
+    if variant == "inherited-env":
+        monkeypatch.setenv("RESTIC_REPOSITORY_FILE", str(tmp_path / "unrelated-repository"))
     if variant == "stopped":
         env.bundle["runtime"]["apps"]["demo"]["status"] = "stopped"
     if variant == "empty":
@@ -205,10 +207,14 @@ async def test_object_size_limit_replay_and_sealed_finalization(receiver, monkey
     sid = await start(env)
     async def chunks(value):
         yield value
-    for value in (b"first", b"retry"):
+    for value in (b"first", b"first"):
         result = await env.receiver.upload(sid, "config", "config", chunks(value), offset=0, owner_token=OWNER_TOKEN)
         assert result["offset"] == 5
-    assert (env.receiver._stage / "config").read_bytes() == b"retry"
+    await env.receiver.upload(sid, "config", "config", chunks(b"suffix"), offset=5, owner_token=OWNER_TOKEN)
+    await env.receiver.upload(sid, "config", "config", chunks(b"first"), offset=0, owner_token=OWNER_TOKEN)
+    assert (env.receiver._stage / "config").read_bytes() == b"firstsuffix"
+    with pytest.raises(m.MigrationError):
+        await env.receiver.upload(sid, "config", "config", chunks(b"wrong"), offset=0, owner_token=OWNER_TOKEN)
     monkeypatch.setattr(m, "CHUNK_LIMIT", 5)
     with pytest.raises(m.MigrationError):
         await env.receiver.upload(sid, "config", "config", chunks(b"123456"), offset=0, owner_token=OWNER_TOKEN)
@@ -313,7 +319,90 @@ async def test_receiver_restart_sanitizes_corrupt_journals(receiver, fault):
     assert "private value" not in json.dumps(restarted.journal_status)
 
 
-@pytest.mark.parametrize("fault", [None, "lost-upload", "lost-finalize", "transfer", "resume", "resume-error", "cancel"])
+@pytest.mark.parametrize("initially_missing", [False, True])
+async def test_transfer_cannot_adopt_a_replacement_app(receiver, tmp_path, initially_missing):
+    env = receiver
+    if initially_missing:
+        env.router.apps.pop("demo")
+        env.router.definitions.pop("demo")
+    sid = await start(env)
+    snapshot = await transfer(env, sid, tmp_path)
+    env.router.apps["demo"] = inventory_entry("demo", "E" * 12)
+    env.router.definitions["demo"] = copy.deepcopy(env.bundle["definitions"]["apps"][0])
+    (env.root / "demo" / "replacement-data").write_text("keep replacement")
+    result = await finish(env, sid, snapshot)
+    assert result["phase"] == "incomplete"
+    assert not env.router.mutations()
+    assert (env.root / "demo" / "replacement-data").read_text() == "keep replacement"
+
+
+async def test_receiving_restart_reclaims_disposable_repository(receiver):
+    env = receiver
+    sid = await start(env)
+    (env.receiver._stage / "config").write_bytes(b"partial upload")
+    env.receiver._monitor.cancel()
+    await asyncio.gather(env.receiver._monitor, return_exceptions=True)
+    backup_app.op_lock.release(OpKind.MIGRATION)
+    restarted = m.MigrationReceiver(lock=backup_app.op_lock, all_app_data=env.root,
+        work_dir=env.root / "backup" / ".migration", router_url=ORIGIN, restore=env.receiver.restore)
+    assert not restarted.needs_attention
+    next_session = await restarted.start({"version": 5, "bundle": env.bundle, "password": env.password}, owner_token=OWNER_TOKEN)
+    assert not (restarted.work / sid).exists()
+    await restarted.abort({"version": 5, "session_id": next_session["session_id"]}, owner_token=OWNER_TOKEN)
+    env.receiver._record = None  # the old process is gone
+
+
+async def test_corrupt_journal_acknowledgment_survives_restart(receiver):
+    env = receiver
+    env.receiver._journal.write_text("corrupt")
+    kwargs = dict(lock=OperationLock(), all_app_data=env.root, work_dir=env.root / "backup" / ".migration",
+                  router_url=ORIGIN, restore=env.receiver.restore)
+    restarted = m.MigrationReceiver(**kwargs)
+    assert restarted.needs_attention
+    await restarted.acknowledge(owner_token=OWNER_TOKEN)
+    assert not m.MigrationReceiver(**kwargs).needs_attention
+
+
+@pytest.mark.parametrize("both_layouts", [False, True])
+async def test_storage_layout_upgrade_preserves_unfinished_recovery(tmp_path, monkeypatch, both_layouts):
+    base = tmp_path / "backup" / ".migration"
+    legacy = base / "migration-v4"
+    legacy.mkdir(parents=True)
+    original = legacy / ("a" * 64) / "trees" / ".migration-old-original"
+    original.mkdir(parents=True)
+    (original / "valuable").write_text("original data")
+    (legacy / "journal.json").write_text(json.dumps({"version": 4, "ok": False, "session_id": "a" * 64,
+                                                    "phase": "finalizing", "needs_attention": True}))
+    if both_layouts:
+        current = base / "migration-v5"
+        current.mkdir()
+        (current / "journal.json").write_text(json.dumps({"version": 5, "session_id": "b" * 64,
+                                                         "phase": "complete", "needs_attention": False, "ok": True}))
+    monkeypatch.setattr(m, "confirm_owner", AsyncMock(return_value=True))
+    kwargs = dict(lock=OperationLock(), all_app_data=tmp_path, work_dir=base, router_url=ORIGIN, restore=AsyncMock())
+    upgraded = m.MigrationReceiver(**kwargs)
+    assert upgraded.work == base / "incoming" and upgraded.needs_attention
+    assert not legacy.exists()
+    retained = upgraded.work / ("a" * 64) / "trees" / ".migration-old-original" / "valuable"
+    assert retained.read_text() == "original data"
+    await upgraded.acknowledge(owner_token=OWNER_TOKEN)
+    assert not m.MigrationReceiver(**kwargs).needs_attention
+    assert retained.read_text() == "original data"
+
+
+async def test_peer_request_has_a_total_deadline(mock_http, monkeypatch):
+    class Slow(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(100):
+                await asyncio.sleep(0.02)
+                yield b" "
+    mock_http(lambda request: httpx.Response(200, stream=Slow()))
+    monkeypatch.setattr(m, "PEER_REQUEST_TIMEOUT", 0.05)
+    with pytest.raises(m.MigrationError):
+        await asyncio.wait_for(m._Peer("https://destination.test", OWNER_TOKEN).request("POST", "/api/migration/receive/abort"), 1)
+
+
+@pytest.mark.parametrize("fault", [None, "lost-upload", "lost-finalize", "transfer", "resume", "resume-error", "cancel", "receiver-restart"])
 async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeypatch, fault):
     env = receiver
     captured = make_bundle("demo", "other", "backup", runtime=True)
@@ -336,6 +425,20 @@ async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeyp
     monkeypatch.setattr(m, "RecoverySession", lambda url, *args: Source() if url == "https://source.test" else factory(url, *args))
     monkeypatch.setattr(m, "capture_configuration", AsyncMock(return_value=captured))
     peer = Peer(env.client, "/object/" if fault == "lost-upload" else "/finalize" if fault == "lost-finalize" else None)
+    finalizations = []
+    if fault == "receiver-restart":
+        request = peer.request
+        async def restarted(method, path, **kwargs):
+            if path.endswith("/finalize"):
+                finalizations.append(path)
+                if len(finalizations) > 1:
+                    raise RuntimeError("Repeated finalize instead of observing interruption")
+                await m._cancel_tasks(env.receiver._monitor)
+                env.receiver._record.update(phase="interrupted", needs_attention=True)
+                backup_app.op_lock.release(OpKind.MIGRATION)
+                raise m.MigrationError("transfer")
+            return await request(method, path, **kwargs)
+        peer.request = restarted
     monkeypatch.setattr(m, "_Peer", lambda *args: peer)
     if fault == "transfer":
         monkeypatch.setattr(m, "_capture_and_transfer", AsyncMock(side_effect=m.MigrationError("transfer")))
@@ -358,12 +461,14 @@ async def test_source_cutover_and_unaffected_cleanup(receiver, tmp_path, monkeyp
         result = False
     else:
         result = await operation
-    assert result == (fault not in {"transfer", "resume", "resume-error", "cancel"}), m.status
+    assert result == (fault not in {"transfer", "resume", "resume-error", "cancel", "receiver-restart"}), m.status
     assert events == ["preflight", "stopped", "cleanup"]
     assert not source_lock.busy and not m.source_recovery.live
     assert m.source_recovery.needs_attention == (not result)
     assert m.source_recovery.journal_status["restart_pending"] == (["other"] if fault in {"resume", "resume-error"} else [])
     assert not list((env.root / "backup" / ".source").glob("outgoing-*"))
+    if fault == "receiver-restart":
+        assert len(finalizations) == 1
 
 
 @pytest.mark.parametrize("failure", ["write", "fsync"])

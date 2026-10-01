@@ -153,43 +153,88 @@ async def _cancel_tasks(*tasks):
     await asyncio.gather(*pending, return_exceptions=True)
 
 
+def _interrupted_record():
+    return {"ok": False, "version": 5, "phase": "interrupted", "needs_attention": True,
+            "result": {"ok": False, "error": "Migration journal requires manual inspection."}}
+
+
+def _receiver_directory(root, work_dir, backup_name):
+    """Converge version-named storage once; never abandon an earlier journal."""
+    base = private_work_dir(root, work_dir, backup_name)
+    work = base / "incoming"
+    for name in ("migration-v4", "migration-v5"):
+        previous = base / name
+        if not previous.exists() and not previous.is_symlink():
+            continue
+        directory(previous)
+        if work.exists():
+            directory(work)
+            # Two layouts are ambiguous. Persist the gate before moving either
+            # journal out of its authoritative location; retain every old tree.
+            if any(previous.iterdir()):
+                save_journal(work / "journal.json", _interrupted_record())
+            previous.rename(work / name)
+        else:
+            previous.rename(work)
+        durability_barrier(base, work)
+    return private_work_dir(root, work, backup_name)
+
+
 class MigrationReceiver:
     """Only transport state lives here; the restore callback owns data recovery."""
 
     def __init__(self, *, lock, all_app_data, work_dir, router_url, restore,
                  backup_app_name="backup", idle_timeout=300, request_timeout=120):
         self.lock, self.root, self.restore = lock, all_app_data, restore
-        self.work = private_work_dir(all_app_data, work_dir, backup_app_name) / "migration-v5"
-        self.work.mkdir(mode=0o700, exist_ok=True)
-        directory(self.work)
+        self.work = _receiver_directory(all_app_data, work_dir, backup_app_name)
         self.router_url, self.backup_app_name = router_url, app_name(backup_app_name)
         self.idle_timeout, self.request_timeout = _positive(idle_timeout), _positive(request_timeout)
         self._mutex = asyncio.Lock()
         self._record = self._stage = self._job = self._monitor = None
-        self._bundle = self._password = None
+        self._bundle = self._password = self._recovery = self._disposable = None
         self._activity = time.monotonic()
         self._journal = self.work / "journal.json"
         if self._journal.exists() or self._journal.is_symlink():
-            self._record = {"ok": False, "version": 5, "phase": "interrupted", "needs_attention": True,
-                            "result": {"ok": False, "error": "Migration journal requires manual inspection."}}
+            self._record = _interrupted_record()
             try:
                 if self._journal.is_symlink() or self._journal.stat().st_size > MAX_JSON_BYTES:
                     raise ValueError
                 saved = _decode_json(self._journal.read_bytes())
-                if type(saved) is not dict or type(saved.get("version")) is not int or saved["version"] != 5:
+                if type(saved) is not dict or type(saved.get("version")) is not int or saved["version"] not in {4, 5}:
                     raise ValueError
-                sid = _session_id(saved["session_id"])
+                sid = saved.get("session_id")
+                if sid is not None:
+                    _session_id(sid)
                 phase = saved["phase"]
-                if phase not in {"receiving", "finalizing", "complete", "incomplete", "aborted", "interrupted"}:
+                if phase not in {"preflighting", "receiving", "finalizing", "complete", "incomplete", "failed", "aborted", "interrupted"}:
                     raise ValueError
-                if type(saved["needs_attention"]) is not bool:
+                acknowledged = saved.get("acknowledged", False)
+                if type(saved["needs_attention"]) is not bool or type(acknowledged) is not bool:
                     raise ValueError
-                attention = saved["needs_attention"] or phase == "finalizing" or (phase == "incomplete" and saved.get("acknowledged") is not True)
-                self._record.update(session_id=sid, needs_attention=attention)
+                if sid is None and (phase != "interrupted" or (not saved["needs_attention"] and not acknowledged)):
+                    raise ValueError
+                if phase == "complete" and saved.get("ok") is not True:
+                    raise ValueError
+                attention = saved["needs_attention"] or phase == "finalizing" or (phase == "incomplete" and not acknowledged)
+                self._record.update(needs_attention=attention, acknowledged=acknowledged)
+                if saved["version"] == 5 and sid is not None:
+                    self._record["session_id"] = sid
                 if "snapshot" in saved:
                     self._record["snapshot"] = _session_id(saved["snapshot"])
+                if phase == "complete" and saved.get("ok") is True and not attention:
+                    self._record.update(ok=True, phase="complete", result={"ok": True})
+                if saved["version"] == 4:
+                    # Legacy trees can hold original data, unlike v5 repositories.
+                    # Keep them, but publish only the current safe journal shape.
+                    self._record.update(phase="interrupted")
+                    if not attention:
+                        self._record["acknowledged"] = True
+                    self._persist(self._record)
+                elif not attention and sid is not None:
+                    self._disposable = self.work / sid
             except (ValueError, OSError, KeyError, TypeError):
-                pass
+                self._record = _interrupted_record()
+                self._disposable = None
 
     @property
     def journal_status(self):
@@ -233,6 +278,11 @@ class MigrationReceiver:
                 raise MigrationError("busy")
             stage = None
             try:
+                if self._disposable is not None:
+                    if self._disposable.exists() or self._disposable.is_symlink():
+                        directory(self._disposable)
+                        await drain(asyncio.to_thread(shutil.rmtree, self._disposable))
+                    self._disposable = None
                 session = RecoverySession(self.router_url, owner_token, bundle, self.backup_app_name)
                 await session.preflight()
                 if not session.restore_app_names:
@@ -243,6 +293,7 @@ class MigrationReceiver:
                 for kind in _OBJECT_KINDS | {"locks"}:
                     (self._stage / kind).mkdir(mode=0o700)
                 self._bundle, self._password = bundle, password
+                self._recovery = session
                 self._record = {"ok": True, "version": 5, "session_id": sid, "phase": "receiving",
                                 "accepted_apps": list(session.restore_app_names), "result": None, "needs_attention": False}
                 self._save()
@@ -256,7 +307,7 @@ class MigrationReceiver:
                     if stage is not None and stage.exists():
                         await drain(asyncio.to_thread(shutil.rmtree, stage))
                 finally:
-                    self._bundle = self._password = None
+                    self._bundle = self._password = self._recovery = None
                     self.lock.release(OpKind.MIGRATION)
                 raise
 
@@ -298,12 +349,14 @@ class MigrationReceiver:
                 raise MigrationError("sequence")
             def write():
                 path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                # Replaying a lost response writes the same range, rather than
-                # appending it twice. Finalization seals uploads before checking.
+                # A delayed retry may follow a newer range. Validate overlap and
+                # preserve its suffix instead of truncating acknowledged bytes.
                 with path.open("r+b" if path.exists() else "wb") as stream:
                     stream.seek(offset)
-                    stream.write(body)
-                    stream.truncate()
+                    existing = stream.read(len(body)) if stream.readable() else b""
+                    if existing != body[:len(existing)]:
+                        raise MigrationError("transfer")
+                    stream.write(body[len(existing):])
             await drain(asyncio.to_thread(write))
             self._activity = time.monotonic()
             self.lock.touch()
@@ -340,7 +393,7 @@ class MigrationReceiver:
                 raise MigrationError("transfer")
             metadata = snapshots.snapshot_metadata(snapshot_id, await _restic(
                 self._stage, self._password, "snapshots", "--json", snapshot_id))
-            result = await self.restore(metadata, self._stage, self._password, owner_token)
+            result = await self.restore(metadata, self._stage, self._password, owner_token, self._recovery)
             self._record["result"] = result
             if result.get("ok") is True:
                 phase = "complete"
@@ -368,7 +421,7 @@ class MigrationReceiver:
                 except OSError:
                     logger.warning("Retaining encrypted migration repository after completion", exc_info=True)
         finally:
-            self._bundle = self._password = None
+            self._bundle = self._password = self._recovery = None
             try:
                 monitor = None if self._monitor is asyncio.current_task() else self._monitor
                 await drain(_cancel_tasks(monitor))
@@ -412,6 +465,8 @@ class MigrationReceiver:
             except OSError:
                 raise MigrationError("failed") from None
             self._record = candidate
+            if self._record.get("session_id"):
+                self._disposable = self.work / self._record["session_id"]
         return self.journal_status
 
 
@@ -534,11 +589,12 @@ class _Peer:
 
     async def request(self, method, path, *, body=None, content=None, headers=None):
         try:
-            async with httpx.AsyncClient(timeout=PEER_REQUEST_TIMEOUT, follow_redirects=False, trust_env=False) as client:
+            async with asyncio.timeout(PEER_REQUEST_TIMEOUT), httpx.AsyncClient(timeout=PEER_REQUEST_TIMEOUT, follow_redirects=False, trust_env=False) as client:
                 async with client.stream(method, self.origin + path, json=body, content=content,
                                          headers={**(headers or {}), "Authorization": "Bearer " + self.token}) as response:
                     if response.status_code != 200:
-                        raise MigrationError("transfer")
+                        code = {401: "auth", 403: "auth", 404: "session", 409: "sequence"}.get(response.status_code, "transfer")
+                        raise MigrationError(code)
                     data = bytearray()
                     async for part in response.aiter_bytes():
                         if len(data) + len(part) > MAX_JSON_BYTES:
@@ -548,7 +604,7 @@ class _Peer:
                     if type(result) is not dict or type(result.get("version")) is not int or result["version"] != 5:
                         raise MigrationError("protocol")
                     return result
-        except (httpx.HTTPError, ConfigurationError):
+        except (httpx.HTTPError, ConfigurationError, TimeoutError):
             raise MigrationError("transfer") from None
 
 
@@ -581,8 +637,8 @@ async def _capture_and_transfer(peer, sid, temporary, password, root, bundle):
                         if answer.get("ok") is not True or type(answer.get("offset")) is not int or answer["offset"] != offset + len(chunk):
                             raise MigrationError("transfer")
                         break
-                    except MigrationError:
-                        if attempt:
+                    except MigrationError as error:
+                        if attempt or error.code != "transfer":
                             raise
                 offset += len(chunk)
     return snapshot_id
@@ -656,15 +712,22 @@ async def run_direct_push(*, target_url, target_token, selected_apps, lock, all_
             snapshot_id = await _capture_and_transfer(peer, sid, temporary, password, all_app_data, bundle)
             status.update(phase="finalizing")
             body = {"version": 5, "session_id": sid, "snapshot": snapshot_id}
+            try:
+                await peer.request("POST", "/api/migration/receive/finalize", body=body)
+            except MigrationError as error:
+                if error.code != "transfer":
+                    raise
             while True:
                 try:
-                    remote = await peer.request("POST", "/api/migration/receive/finalize", body=body)
+                    remote = await peer.request("GET", f"/api/migration/receive/status/{sid}")
                     if remote.get("session_id") != sid:
                         raise MigrationError("session")
                     if remote.get("phase") == "complete":
                         outcome = remote.get("result", {}).get("ok") is True
                         break
-                    if remote.get("phase") != "finalizing":
+                    if remote.get("phase") == "receiving":
+                        await peer.request("POST", "/api/migration/receive/finalize", body=body)
+                    elif remote.get("phase") != "finalizing":
                         raise MigrationError("failed")
                 except MigrationError as error:
                     if error.code != "transfer":

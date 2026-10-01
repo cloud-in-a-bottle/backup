@@ -599,6 +599,8 @@ async def _verify_admin_token(supplied: str | None) -> bool:
 def _restic_env(conf: dict) -> dict:
     """Environment for invoking the restic binary with repo + password set."""
     env = os.environ.copy()
+    if conf.get("_isolated_restic"):
+        env = {key: value for key, value in env.items() if not key.startswith("RESTIC_")}
     env["RESTIC_REPOSITORY"] = conf["repo"]
     env["RESTIC_PASSWORD"] = conf.get("repo_password", "")
     # Suppress progress output in unattended runs; JSON flag gives structured
@@ -1919,7 +1921,7 @@ async def _snapshot_needs_owner(snapshot_id: str) -> bool:
     return snapshot.has_configuration
 
 
-async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snapshot, conf: dict, owner_token: str) -> bool:
+async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snapshot, conf: dict, owner_token: str, *, session=None) -> bool:
     global restore_progress, restore_last_status, restore_last_snapshot, _restore_session
     if not owner_token:
         raise snapshot_configuration.SnapshotConfigurationError(
@@ -1931,7 +1933,8 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
     bundle = await snapshot_configuration.read_configuration(snapshot.id, _restic_env(conf))
     if snapshot.has_runtime != (bundle["runtime"] is not None):
         raise snapshot_configuration.SnapshotConfigurationError("The configuration does not match the snapshot's runtime metadata tag.")
-    session = RecoverySession(ROUTER_URL, owner_token, bundle, APP_NAME)
+    preflighted = session is not None
+    session = session or RecoverySession(ROUTER_URL, owner_token, bundle, APP_NAME)
     previous_attention = _restore_needs_attention
     previous_apps = list((restore_progress or {}).get("affected_apps", [])) if previous_attention else []
     previous_roots = list((restore_progress or {}).get("affected_roots", [])) if previous_attention else []
@@ -2077,7 +2080,8 @@ async def _restore_configuration_snapshot(snapshot: snapshot_configuration.Snaps
             _restore_session = None
     try:
         _checkpoint_restore("preflight", needs_attention=previous_attention)
-        await session.preflight()
+        if not preflighted:
+            await session.preflight()
         _checkpoint_restore("staging", needs_attention=previous_attention)
         # Download/verify before stopping any application. Each staging tree is
         # on the destination filesystem so the final directory promotion is an
@@ -3306,13 +3310,13 @@ async def receive_finalize():
     return jsonify(await _receiver().finalize(await _migration_json(), owner_token=token))
 
 
-async def _restore_migration_snapshot(snapshot, repository, password, owner_token):
+async def _restore_migration_snapshot(snapshot, repository, password, owner_token, session):
     """Incoming migration uses the ordinary restore transaction and journal."""
     global restore_last_snapshot, restore_last_status
     restore_last_snapshot, restore_last_status = None, None
-    conf = {"repo": str(repository), "repo_password": password, "env": {}}
+    conf = {"repo": str(repository), "repo_password": password, "env": {}, "_isolated_restic": True}
     try:
-        ok = await _restore_configuration_snapshot(snapshot, conf, owner_token)
+        ok = await _restore_configuration_snapshot(snapshot, conf, owner_token, session=session)
     except BaseException:
         restore_last_status = "error: Incoming snapshot recovery did not complete."
         raise
