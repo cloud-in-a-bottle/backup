@@ -1108,6 +1108,49 @@ class TestZoneTagging:
 class TestSnapshotBrowsing:
     """Browse the actual snapshot tree, including paths outside named data roots."""
 
+    async def test_backup_view_groups_contents_without_hiding_other_paths(self, client):
+        def entry(path, is_dir=True):
+            return {"path": path, "is_dir": is_dir, "size": 0, "mod_time": ""}
+        tree = {
+            "": [entry("data"), entry("tmp"), entry("home"), entry("readme.txt", False)],
+            "data": [entry("app_data"), entry("app_temp_data"), entry("vm_data"), entry("extra"), entry("log.txt", False)],
+            "tmp": [entry("bottle-backup-configuration"), entry("other.txt", False)],
+        }
+        async def listing(snapshot_id, subpath="", root=None):
+            return tree[subpath], None
+        with patch.object(backup_app, "list_snapshot_files", listing):
+            response = await client.get("/api/snapshot/files", query_string={"snapshot": "a" * 64, "view": "backup"})
+        body = await response.get_json()
+        assert response.status_code == 200 and body["ok"]
+        assert {entry["path"]: entry["browse_path"] for entry in body["files"]} == {
+            "app_data": "data/app_data", "app_temp_data": "data/app_temp_data", "vm_data": "data/vm_data",
+            "platform_configuration": "tmp/bottle-backup-configuration", "data/extra": "data/extra",
+            "data/log.txt": "data/log.txt", "tmp/other.txt": "tmp/other.txt", "home": "home", "readme.txt": "readme.txt",
+        }
+
+    async def test_backup_view_preserves_empty_directories_and_disambiguates_names(self, client):
+        tree = {
+            "": [{"path": p, "is_dir": True} for p in ["data", "tmp", "app_data"]],
+            "data": [{"path": "app_data", "is_dir": True}],
+            "tmp": [],
+        }
+        async def listing(snapshot_id, subpath=""):
+            return tree[subpath], None
+        with patch.object(backup_app, "list_snapshot_files", listing):
+            files, error = await backup_app.list_snapshot_contents("a" * 64)
+        assert error is None
+        assert {entry["path"] for entry in files} == {"data/app_data", "app_data", "tmp"}
+        assert {entry["browse_path"] for entry in files} == {"data/app_data", "app_data", "tmp"}
+
+    async def test_backup_view_does_not_report_partial_results_on_listing_failure(self, client):
+        async def listing(snapshot_id, subpath=""):
+            if subpath:
+                return [], "Cannot read snapshot directory"
+            return [{"path": "data", "is_dir": True}], None
+        with patch.object(backup_app, "list_snapshot_files", listing):
+            files, error = await backup_app.list_snapshot_contents("a" * 64)
+        assert files == [] and error == "Cannot read snapshot directory"
+
     async def test_top_level_shows_every_snapshot_entry(self, client):
         async def listing(args, conf, timeout, on_line):
             assert args == ["ls", "--json", "a" * 64, "/", "--no-lock"]

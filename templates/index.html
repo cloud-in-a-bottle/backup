@@ -1186,16 +1186,16 @@
         // are unsafe with user-controllable content (adversarial filenames in
         // snapshots). Using textContent + data-* + delegated listeners is
         // safe because the DOM never interprets the value as code.
-        function makeBrowseLink(label, path) {
+        function makeBrowseLink(label, path, topLevel = null) {
             const span = document.createElement("button");
             span.className = "browse-link";
             span.textContent = label;
             span.dataset.path = path || "";
-            span.addEventListener("click", () => browseSnapshot(path));
+            span.addEventListener("click", () => browseSnapshot(path, topLevel));
             return span;
         }
 
-        function renderFileBrowser(res, subpath) {
+        function renderFileBrowser(res, subpath, topLevel) {
             const body = document.getElementById("browse-body");
             const breadcrumb = document.getElementById("browse-breadcrumb");
 
@@ -1212,15 +1212,20 @@
                 return;
             }
 
-            // Breadcrumb follows the actual paths stored in the snapshot.
+            // Keep the backup-folder label while navigating its stored path.
             breadcrumb.textContent = "";
             breadcrumb.appendChild(makeBrowseLink("snapshot", ""));
-            const parts = subpath ? subpath.split("/") : [];
-            let accumulated = "";
-            parts.forEach((p, i) => {
-                accumulated += (i > 0 ? "/" : "") + p;
+            if (topLevel) {
                 breadcrumb.appendChild(document.createTextNode(" / "));
-                breadcrumb.appendChild(makeBrowseLink(p, accumulated));
+                breadcrumb.appendChild(makeBrowseLink(topLevel.label, topLevel.path, topLevel));
+            }
+            const relative = topLevel ? subpath.slice(topLevel.path.length) : subpath;
+            const parts = relative ? relative.split("/").filter(Boolean) : [];
+            let accumulated = topLevel ? topLevel.path : "";
+            parts.forEach(p => {
+                accumulated += (accumulated ? "/" : "") + p;
+                breadcrumb.appendChild(document.createTextNode(" / "));
+                breadcrumb.appendChild(makeBrowseLink(p, accumulated, topLevel));
             });
 
             body.textContent = "";
@@ -1247,8 +1252,9 @@
                 const nameTd = document.createElement("td");
                 nameTd.style.cssText = "padding:6px 8px;";
                 if (f.is_dir) {
-                    const fullPath = subpath ? subpath + "/" + f.path : f.path;
-                    nameTd.appendChild(makeBrowseLink("\uD83D\uDCC1 " + f.path, fullPath));
+                    const fullPath = f.browse_path || (subpath ? subpath + "/" + f.path : f.path);
+                    const folder = topLevel || { path: fullPath, label: f.path };
+                    nameTd.appendChild(makeBrowseLink("\uD83D\uDCC1 " + f.path, fullPath, folder));
                 } else {
                     nameTd.textContent = "\uD83D\uDCC4 " + f.path;
                 }
@@ -1268,7 +1274,7 @@
             });
         }
 
-        async function browseSnapshot(subpath) {
+        async function browseSnapshot(subpath, topLevel = null) {
             if (!selectedSnapshotId) return;
             const container = document.getElementById("browse-container");
             const body = document.getElementById("browse-body");
@@ -1277,8 +1283,9 @@
 
             let url = "/api/snapshot/files?snapshot=" + encodeURIComponent(selectedSnapshotId);
             if (subpath) url += "&path=" + encodeURIComponent(subpath);
+            else url += "&view=backup";
             const res = await api(url);
-            renderFileBrowser(res, subpath || "");
+            renderFileBrowser(res, subpath || "", topLevel);
         }
 
         function snapshotScope(snapshot) {

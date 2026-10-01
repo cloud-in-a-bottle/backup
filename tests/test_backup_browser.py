@@ -175,6 +175,13 @@ class MockAPI:
             "tmp": [{"path": "bottle-backup-configuration", "is_dir": True}],
             "tmp/bottle-backup-configuration": [{"path": "configuration.json", "is_dir": False, "size": 123}],
         }
+        files = tree.get(snapshot_path, [])
+        if query.get("view") == ["backup"] and not snapshot_path:
+            files = [{"path": name, "is_dir": True, "browse_path": "data/" + name}
+                     for name in ["app_data", "app_temp_data"]]
+            if query.get("snapshot") != [LEGACY]:
+                files.append({"path": "platform_configuration", "is_dir": True,
+                              "browse_path": "tmp/bottle-backup-configuration"})
         responses = {
             "status": {"busy": self.busy, "running": False},
             "restore/status": self.restore,
@@ -187,7 +194,7 @@ class MockAPI:
             "history": {"ok": True, "history": []},
             "repo/stats": {"ok": True, "stats": {}},
             "apps-status": {"ok": True, "apps": {"notes": {"status": "running"}, "secrets": {"status": "stopped"}}},
-            "snapshot/files": {"ok": True, "files": tree.get(snapshot_path, [])},
+            "snapshot/files": {"ok": True, "files": files},
         }
         if path not in responses:
             await route.fulfill(status=404, json={"ok": False})
@@ -244,7 +251,6 @@ async def test_snapshot_contents_keyboard_selection_and_file_browser(browser_ui)
     await expect(page.locator("#selected-snapshot-scope")).to_be_visible()
     await expect(page.locator("#selected-snapshot-scope")).to_contain_text("App definitions, API keys and app states are not included")
     await page.get_by_role("button", name="Browse", exact=True).click()
-    await page.get_by_role("button", name="📁 data", exact=True).click()
     await expect(page.get_by_role("button", name="📁 app_data")).to_be_visible()
     await select_snapshot(page, "bbbbbbbb")
     await expect(contents).to_have_text("Files and app definitions")
@@ -252,18 +258,18 @@ async def test_snapshot_contents_keyboard_selection_and_file_browser(browser_ui)
     await select_snapshot(page)
     await expect(contents).to_have_text("Files and settings")
     await page.get_by_role("button", name="Browse", exact=True).click()
-    await page.get_by_role("button", name="📁 tmp", exact=True).click()
-    await page.get_by_role("button", name="📁 bottle-backup-configuration", exact=True).click()
+    await page.get_by_role("button", name="📁 platform_configuration", exact=True).click()
     await expect(page.locator("#browse-body")).to_contain_text("configuration.json")
-    await expect(page.locator("#browse-breadcrumb")).to_have_text("snapshot / tmp / bottle-backup-configuration")
-    await page.locator("#browse-breadcrumb").get_by_role("button", name="tmp", exact=True).click()
-    await expect(page.get_by_role("button", name="📁 bottle-backup-configuration", exact=True)).to_be_visible()
+    await expect(page.locator("#browse-breadcrumb")).to_have_text("snapshot / platform_configuration")
+    await page.locator("#browse-breadcrumb").get_by_role("button", name="platform_configuration", exact=True).click()
+    await expect(page.locator("#browse-body")).to_contain_text("configuration.json")
     await page.locator("#browse-breadcrumb").get_by_role("button", name="snapshot", exact=True).click()
-    await expect(page.get_by_role("button", name="📁 data", exact=True)).to_be_visible()
-    await page.get_by_role("button", name="📁 data", exact=True).click()
     await page.get_by_role("button", name="📁 app_data", exact=True).click()
     await page.get_by_role("button", name="📁 " + UNUSUAL_DIR, exact=True).click()
     await expect(page.locator("#browse-body")).to_contain_text("notes.json")
+    await expect(page.locator("#browse-breadcrumb")).to_have_text("snapshot / app_data / " + UNUSUAL_DIR)
+    await page.locator("#browse-breadcrumb").get_by_role("button", name="app_data", exact=True).click()
+    await expect(page.get_by_role("button", name="📁 " + UNUSUAL_DIR, exact=True)).to_be_visible()
 
 
 async def test_restore_acceptance_busy_and_eventual_verified_success(browser_ui):

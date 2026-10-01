@@ -97,12 +97,14 @@ Retention runs `forget` inline after the backup and reconciles the backup histor
 
 Each successful backup creates a restic snapshot tagged with `bottle`. Older snapshots tagged `openhost` are still listed, restored, and expired. The UI lists snapshots newest-first and lets you:
 
-- Browse the complete snapshot tree, including app data and `/tmp/bottle-backup-configuration/configuration.json`
+- Browse `app_data`, `app_temp_data`, and `platform_configuration` side by side, along with any additional captured paths
 - Restore a full snapshot (all captured data roots, with the exclusions described below; single-root restore is API-only)
 - Delete a snapshot (runs `restic forget --prune` to reclaim space)
 - Name or rename a snapshot for easier identification
 
 Select a snapshot and expand its contents summary to see which files and settings were captured. Legacy snapshots remain usable but cannot recreate missing app definitions or API keys.
+
+The browser groups stored paths under these folder names, including for existing snapshots. The original filesystem tree remains available through `/api/snapshot/files`; `view=backup` returns the grouped top level with each entry's original `browse_path` for navigation.
 
 The Status panel shows the **repo size**, the deduplicated, compressed on-disk footprint (`restic stats --mode raw-data`). Because computing it is slow on large/remote repos, the value is cached: it is recomputed and stored after each backup and after a snapshot delete/prune, and served from the cache on page load. The backup history database is reconciled against restic on every snapshot listing, so rows for snapshots that no longer exist are cleaned up automatically.
 

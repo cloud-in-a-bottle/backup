@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1366,6 +1367,39 @@ async def list_snapshot_files(
             return [], "Snapshot or path not found"
         return [], f"restic error: {err}"
     return files, None
+
+
+async def list_snapshot_contents(snapshot_id: str):
+    """Put backup contents side by side, retaining their actual browse paths."""
+    entries, error = await list_snapshot_files(snapshot_id)
+    if error:
+        return [], error
+    aliases = {
+        "data/app_data": "app_data",
+        "data/app_temp_data": "app_temp_data",
+        "data/vm_data": "vm_data",
+        "tmp/bottle-backup-configuration": "platform_configuration",
+    }
+    contents = []
+    for entry in entries:
+        path = entry["path"]
+        if entry["is_dir"] and path in {"data", "tmp"}:
+            children, error = await list_snapshot_files(snapshot_id, path)
+            if error:
+                return [], error
+            if children:
+                for child in children:
+                    actual = path + "/" + child["path"]
+                    label = aliases.get(actual, actual) if child["is_dir"] else actual
+                    contents.append({**child, "path": label, "browse_path": actual})
+                continue
+        # Keep other captured paths and empty directories visible too.
+        contents.append({**entry, "browse_path": path})
+    labels = Counter(entry["path"] for entry in contents)
+    for entry in contents:
+        if labels[entry["path"]] > 1:
+            entry["path"] = entry["browse_path"]
+    return contents, None
 
 
 async def delete_snapshot(snapshot_id: str) -> bool:
@@ -2771,8 +2805,14 @@ async def snapshot_files():
     subpath = request.args.get("path", "")
     if not validate_subpath(subpath):
         return jsonify(ok=False, error="Invalid path"), 400
+    view = request.args.get("view", "tree")
+    if view not in {"tree", "backup"}:
+        return jsonify(ok=False, error="Unknown snapshot view"), 400
     try:
-        files, error = await list_snapshot_files(snapshot_id, subpath, root=root)
+        if view == "backup" and root is None and not subpath:
+            files, error = await list_snapshot_contents(snapshot_id)
+        else:
+            files, error = await list_snapshot_files(snapshot_id, subpath, root=root)
         if error:
             status_code = 404 if "not found" in error.lower() else 500
             return jsonify(ok=False, error=error), status_code
