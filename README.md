@@ -280,3 +280,7 @@ uv run --frozen --group dev pytest tests/ -v
 ```
 
 On a host with locally supplied Chromium libraries, load that environment and use `playwright install chromium` without `--with-deps`. Browser tests run an isolated local Quart/Hypercorn server with Chromium route mocks for expensive backend actions. They check recovery scopes, acceptance versus completion, incomplete notices and retries, private-field suppression, push-only migration, keyboard/mobile operation and axe accessibility. They fail rather than skip when Chromium or axe is missing. CI installs the pinned restic and browser versions and runs the complete suite, including real-restic transfer and restore tests.
+
+## License
+
+The original Backup application and its Cloud in a Bottle packaging are licensed under the [MIT License](LICENSE). Restic and other third-party components retain their own licenses.
