@@ -9,11 +9,12 @@ import secrets
 logger = logging.getLogger(__name__)
 
 
-def save_journal(path: Path, record: dict) -> None:
+def save_journal(path: Path, record: dict, *, retain_previous: bool = False) -> None:
     """Publish under the operation lock; failure restores the old file or absence.
 
     The caller supplies an app-owned private directory and non-secret progress.
     Originals must remain intact until this function returns successfully.
+    Layout migrations retain the predecessor for manual recovery inspection.
     """
     temporary = path.with_suffix(".tmp")
     previous = path.parent / ("journal-rollback-" + secrets.token_hex(16) + ".json")
@@ -27,6 +28,8 @@ def save_journal(path: Path, record: dict) -> None:
         if path.exists() or path.is_symlink():
             os.link(path, previous, follow_symlinks=False)
             linked = True
+            if retain_previous:
+                os.fsync(directory_fd)
         temporary.replace(path)
         published = True
         os.fsync(directory_fd)
@@ -43,7 +46,7 @@ def save_journal(path: Path, record: dict) -> None:
                 logger.error("Journal rollback failed; retained predecessor at %s", previous, exc_info=True)
         raise
     else:
-        if linked:
+        if linked and not retain_previous:
             try:
                 previous.unlink()
             except OSError:

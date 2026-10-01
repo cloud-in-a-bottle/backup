@@ -319,16 +319,21 @@ async def test_receiver_restart_sanitizes_corrupt_journals(receiver, fault):
     assert "private value" not in json.dumps(restarted.journal_status)
 
 
-@pytest.mark.parametrize("initially_missing", [False, True])
-async def test_transfer_cannot_adopt_a_replacement_app(receiver, tmp_path, initially_missing):
+@pytest.mark.parametrize("change", ["identity", "new-app", "source", "ports"])
+async def test_transfer_cannot_adopt_changed_destination_configuration(receiver, tmp_path, change):
     env = receiver
-    if initially_missing:
+    if change == "new-app":
         env.router.apps.pop("demo")
         env.router.definitions.pop("demo")
     sid = await start(env)
     snapshot = await transfer(env, sid, tmp_path)
-    env.router.apps["demo"] = inventory_entry("demo", "E" * 12)
-    env.router.definitions["demo"] = copy.deepcopy(env.bundle["definitions"]["apps"][0])
+    if change in {"identity", "new-app"}:
+        env.router.apps["demo"] = inventory_entry("demo", "E" * 12)
+        env.router.definitions["demo"] = copy.deepcopy(env.bundle["definitions"]["apps"][0])
+    elif change == "source":
+        env.router.definitions["demo"]["source"]["ref"] = "other-ref"
+    else:
+        env.router.definitions["demo"]["port_mappings"].append({"label": "other", "container_port": 8081, "host_port": 32000})
     (env.root / "demo" / "replacement-data").write_text("keep replacement")
     result = await finish(env, sid, snapshot)
     assert result["phase"] == "incomplete"
@@ -371,8 +376,10 @@ async def test_storage_layout_upgrade_preserves_unfinished_recovery(tmp_path, mo
     original = legacy / ("a" * 64) / "trees" / ".migration-old-original"
     original.mkdir(parents=True)
     (original / "valuable").write_text("original data")
-    (legacy / "journal.json").write_text(json.dumps({"version": 4, "ok": False, "session_id": "a" * 64,
-                                                    "phase": "finalizing", "needs_attention": True}))
+    legacy_record = {"version": 4, "ok": False, "session_id": "a" * 64, "phase": "finalizing", "needs_attention": True,
+                     "recovery": {"paused_apps": [{"name": "demo", "app_id": "D" * 12, "restart": "pending"}]},
+                     "retained_sessions": ["a" * 64]}
+    (legacy / "journal.json").write_text(json.dumps(legacy_record))
     if both_layouts:
         current = base / "migration-v5"
         current.mkdir()
@@ -385,6 +392,8 @@ async def test_storage_layout_upgrade_preserves_unfinished_recovery(tmp_path, mo
     assert not legacy.exists()
     retained = upgraded.work / ("a" * 64) / "trees" / ".migration-old-original" / "valuable"
     assert retained.read_text() == "original data"
+    journals = list(upgraded.work.glob("journal-rollback-*.json"))
+    assert any(json.loads(path.read_text()) == legacy_record for path in journals)
     await upgraded.acknowledge(owner_token=OWNER_TOKEN)
     assert not m.MigrationReceiver(**kwargs).needs_attention
     assert retained.read_text() == "original data"

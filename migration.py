@@ -172,7 +172,7 @@ def _receiver_directory(root, work_dir, backup_name):
             # Two layouts are ambiguous. Persist the gate before moving either
             # journal out of its authoritative location; retain every old tree.
             if any(previous.iterdir()):
-                save_journal(work / "journal.json", _interrupted_record())
+                save_journal(work / "journal.json", _interrupted_record(), retain_previous=True)
             previous.rename(work / name)
         else:
             previous.rename(work)
@@ -229,7 +229,7 @@ class MigrationReceiver:
                     self._record.update(phase="interrupted")
                     if not attention:
                         self._record["acknowledged"] = True
-                    self._persist(self._record)
+                    save_journal(self._journal, self._record, retain_previous=True)
                 elif not attention and sid is not None:
                     self._disposable = self.work / sid
             except (ValueError, OSError, KeyError, TypeError):

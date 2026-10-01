@@ -439,6 +439,12 @@ class RecoverySession:
                 self._check_stable(inventory)
                 if inventory != self._baseline:
                     raise ConfigurationError("destination_changed")
+                document = _validate_sharing_definitions(
+                    await self._client.post("/api/app-definitions/export", {"mode": "sharing"}))
+                self._check_existing_configuration(document, inventory, self._plans)
+                inventory = _inventory(await self._client.get("/api/apps"))
+                if inventory != self._baseline:
+                    raise ConfigurationError("destination_changed")
                 for name, app in inventory.items():
                     # The source executor's name may identify a different writer
                     # here. Only this destination's active executor cannot stop.
