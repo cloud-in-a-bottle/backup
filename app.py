@@ -2798,7 +2798,7 @@ async def trigger_restore():
 @route("/api/restore/status")
 async def restore_status_endpoint():
     return jsonify(
-        running=op_lock.restore_running,
+        running=op_lock.restore_running or _restore_session is not None,
         last_restore=restore_last_snapshot,
         last_status=restore_last_status,
         needs_attention=_restore_needs_attention,
@@ -3308,8 +3308,14 @@ async def receive_finalize():
 
 async def _restore_migration_snapshot(snapshot, repository, password, owner_token):
     """Incoming migration uses the ordinary restore transaction and journal."""
+    global restore_last_snapshot, restore_last_status
+    restore_last_snapshot, restore_last_status = None, None
     conf = {"repo": str(repository), "repo_password": password, "env": {}}
-    ok = await _restore_configuration_snapshot(snapshot, conf, owner_token)
+    try:
+        ok = await _restore_configuration_snapshot(snapshot, conf, owner_token)
+    except BaseException:
+        restore_last_status = "error: Incoming snapshot recovery did not complete."
+        raise
     return {"ok": ok, "recovery": (restore_progress or {}).get("recovery")}
 
 

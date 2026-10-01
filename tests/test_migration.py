@@ -117,6 +117,12 @@ async def test_real_snapshot_transfer_and_shared_restore(receiver, tmp_path, var
             assert APP_SECRET.encode() not in path.read_bytes()
     (env.root / "demo" / "stale-wal").write_text("stale destination data")
     (env.root / "demo" / "secret.txt").write_text("destination")
+    backup_app.restore_last_status = "success"
+    async def check_live_restore_status(request, body, response):
+        progress = await (await env.client.get("/api/restore/status")).get_json()
+        assert progress["running"] is True
+        assert progress["last_status"] is None
+    env.router.after["/api/app-definitions/import-private"] = check_live_restore_status
     result = await finish(env, sid, snapshot)
     assert result["phase"] == "complete", result
     assert result["result"]["ok"] and not result["needs_attention"]
