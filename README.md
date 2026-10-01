@@ -242,3 +242,7 @@ uv pip install -r pyproject.toml
 uv pip install pytest pytest-asyncio
 uv run pytest tests/ -v
 ```
+
+## License
+
+The original Backup application and its Cloud in a Bottle packaging are licensed under the [MIT License](LICENSE). Restic and other third-party components retain their own licenses.
