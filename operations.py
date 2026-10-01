@@ -9,6 +9,7 @@ operation may run at a time**.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -161,3 +162,30 @@ class OperationLock:
     @property
     def prune_running(self) -> bool:
         return self._active == OpKind.PRUNE
+
+
+async def drain(coroutine):
+    """Run one coroutine to completion as an independent task.
+
+    Cancellation waits for that task rather than abandoning a local mutation
+    mid-write, and repeated cancellation is tolerated. The caller still receives
+    CancelledError even when the drained operation then failed; the failure is
+    retrieved so it never surfaces as an unretrieved-exception warning. Callers
+    own a shared responsibility here: an operation that must survive
+    cancellation owes its own journal, and nothing that already ran twice
+    remotely may be installed again.
+    """
+    task = asyncio.create_task(coroutine)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError() from None
+    return task.result()

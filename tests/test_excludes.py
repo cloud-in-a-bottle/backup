@@ -27,7 +27,10 @@ def test_backup_excludes_includes_self_repo_dir() -> None:
     """The backup app's own repo dir is also excluded so restic
     snapshots don't grow recursively when the repo is local.
     """
-    assert backup_app.ALL_APP_DATA / "backup" in backup_app.BACKUP_EXCLUDES
+    # Use the running app name rather than a literal, so the assertion holds
+    # for any instance name and any OPENHOST_APP_NAME override.
+    assert backup_app.ALL_APP_DATA / backup_app.APP_NAME in backup_app.BACKUP_EXCLUDES
+    assert backup_app.APP_TEMP_DATA / backup_app.APP_NAME in backup_app.BACKUP_EXCLUDES
 
 
 def test_app_archive_not_in_backup_roots() -> None:
@@ -38,9 +41,7 @@ def test_app_archive_not_in_backup_roots() -> None:
 
 
 def test_app_archive_not_in_root_names() -> None:
-    """The restore UI surfaces ``_ROOT_NAMES`` to operators — the
-    archive tier shouldn't be selectable as a restore target.
-    """
+    """The archive tier is not a root-specific restore shortcut."""
     assert "app_archive" not in backup_app._ROOT_NAMES
     assert Path("/data/app_archive") not in backup_app._ROOT_NAMES.values()
 
@@ -107,5 +108,5 @@ def test_backup_scope_summary_marks_self_repo_as_implementation_detail() -> None
     summary = backup_app._backup_scope_summary()
     by_path = {entry["path"]: entry for entry in summary["excluded"]}
 
-    assert by_path["/data/app_data/backup"]["user_facing"] is False
+    assert by_path[str(backup_app.ALL_APP_DATA / backup_app.APP_NAME)]["user_facing"] is False
     assert by_path["/data/app_archive"]["user_facing"] is True

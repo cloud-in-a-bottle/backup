@@ -21,10 +21,31 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Install restic 0.19.1
         run: |
-          uv venv
-          uv pip install -r pyproject.toml
-          uv pip install pytest pytest-asyncio
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/restic.bz2" https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2
+          curl --fail --location --retry 3 -o "$RUNNER_TEMP/restic-checksums" https://github.com/restic/restic/releases/download/v0.19.1/SHA256SUMS
+          EXPECTED=$(awk '$2 == "restic_0.19.1_linux_amd64.bz2" {print $1}' "$RUNNER_TEMP/restic-checksums")
+          test -n "$EXPECTED"
+          echo "$EXPECTED  $RUNNER_TEMP/restic.bz2" | sha256sum --check
+          bunzip2 "$RUNNER_TEMP/restic.bz2"
+          chmod +x "$RUNNER_TEMP/restic"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Install Chromium and accessibility checker
+        run: |
+          uv run --frozen playwright install --with-deps chromium
+          npm install --prefix "$RUNNER_TEMP/browser-a11y" --no-audit --no-fund axe-core@4.10.3
+          echo "AXE_CORE_PATH=$RUNNER_TEMP/browser-a11y/node_modules/axe-core/axe.min.js" >> "$GITHUB_ENV"
 
       - name: Run tests
-        run: uv run pytest tests/ -v
+        run: |
+          restic version
+          uv run --frozen --group dev pytest tests/ -v
+
+      - name: Verify production image
+        run: |
+          docker build --tag backup:test .
+          docker run --rm backup:test restic version
