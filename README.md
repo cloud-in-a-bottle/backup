@@ -20,6 +20,8 @@ The app has `access_all_app_data = true` in its manifest, which exposes apps' pe
 
 The manifest requests a global `Private` grant for `github.com/cloud-in-a-bottle/cloud-in-a-bottle/services/app-definitions`. For an older installation, use native Update & Reload and approve the permission request. Missing approval or failed export fails the backup instead of silently creating a data-only recovery point. Basic definition and API-key backups need only the app token and approved export grant; an invalid configured owner token also fails the backup.
 
+`cloudinabottle.toml` sets `prebuilt_image`, so Cloud in a Bottle pulls our signed prebuilt image (built by CI from each release tag) instead of building the Dockerfile. To fork and modify this app, comment out `prebuilt_image` so your instance builds from source.
+
 ## Backup scope
 
 Each backup captures these directories only if they are present in the backup app's container, subject to the exclusions below:

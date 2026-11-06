@@ -1,6 +1,6 @@
 [app]
 name = "backup"
-version = "0.2.0"
+version = "1.0.0"
 description = "Encrypted backups and recovery of app data, configuration, and API keys"
 
 [runtime]
@@ -8,6 +8,9 @@ type = "serverfull"
 
 [runtime.container]
 image = "Dockerfile"
+# Cloud in a Bottle pulls this signed prebuilt image (built from the release tag's commit by CI) instead of building
+# `image`. If you fork this app and change it, comment this line out so your instance builds `image` instead.
+prebuilt_image = "registry.cloudinabottle.org/backup"
 port = 8080
 
 [resources]
