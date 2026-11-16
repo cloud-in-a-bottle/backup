@@ -1,6 +1,7 @@
 [app]
 name = "backup"
-version = "1.0.0"
+version = "1.0.1"
+release_tag_format = "semver"
 description = "Encrypted backups and recovery of app data, configuration, and API keys"
 
 [runtime]
